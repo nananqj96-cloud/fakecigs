@@ -43,7 +43,7 @@ public class ExampleMod implements ModInitializer {
 
 	// ===================== SETTINGS (change these if you want) =====================
 	private static final int TRIGGER_Y = -10;            // only triggers when you break a block at or below this Y
-	private static final double CHANCE = 0.03;           // 3% chance per block broken below TRIGGER_Y
+	private static final double CHANCE = 1.0;           // 3% chance per block broken below TRIGGER_Y
 	private static final long COOLDOWN_MS = 120_000L;    // 2 minutes between fake bases
 	private static final int MIN_GAP = 8;                // fake base is at least this far to the side of you (X and Z)
 	private static final int EXTRA_RANGE = 18;           // plus a random 0..18 extra blocks
