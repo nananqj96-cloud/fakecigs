@@ -64,7 +64,8 @@ public class ExampleMod implements ModInitializer {
 	private static final int MIN_BUILD_Y = -58;          // never build below this (stay above bedrock)
 	private static final int MAX_VOLUME = 3_000_000;     // skip schematics bigger than this many blocks
 	private static final int BLOCKS_PER_TICK = 6000;     // placement speed (lower = less lag)
-	private static final int TILES_PER_TICK = 40;        // chests etc. filled per tick after the blocks are placed
+	private static final int TILES_PER_TICK = 40;        // chests / entities handled per tick after the blocks are placed
+	private static final int DEPTH = 1;                  // 3x3 mining depth: 1 = flat 3x3 layer (like the real plugin), 3 = 3x3x3
 	// ===============================================================================
 
 	private static Job activeJob = null;
@@ -72,7 +73,7 @@ public class ExampleMod implements ModInitializer {
 
 	// 3x3 mining state (only touched on the server thread)
 	private static final Set<UUID> ENABLED_3X3 = new HashSet<>();
-	private static final Map<UUID, Direction.Axis> PENDING_AXIS = new HashMap<>();
+	private static final Map<UUID, Direction> PENDING_FACE = new HashMap<>();
 	private static boolean breakingExtra = false;
 
 	@Override
@@ -98,7 +99,7 @@ public class ExampleMod implements ModInitializer {
 
 		// ---- remember which face of the block the player is mining ----
 		PlayerBlockBreakEvents.BEFORE.register((world, player, pos, state, blockEntity) -> {
-			rememberAxis(world, player, pos);
+			rememberFace(world, player, pos);
 			return true;
 		});
 
@@ -122,7 +123,7 @@ public class ExampleMod implements ModInitializer {
 		ServerTickEvents.END_SERVER_TICK.register(server -> tickJob());
 		ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
 			activeJob = null;
-			PENDING_AXIS.clear();
+			PENDING_FACE.clear();
 			breakingExtra = false;
 		});
 
@@ -135,7 +136,7 @@ public class ExampleMod implements ModInitializer {
 
 	// ------------------------------------------------------------------ 3x3 mining
 
-	private static void rememberAxis(Level world, Player player, BlockPos pos) {
+	private static void rememberFace(Level world, Player player, BlockPos pos) {
 		if (breakingExtra) return;
 		if (!(world instanceof ServerLevel level)) return;
 		if (level.getServer().isDedicatedServer()) return;
@@ -146,39 +147,45 @@ public class ExampleMod implements ModInitializer {
 		if (hit instanceof BlockHitResult bhr
 				&& bhr.getType() == HitResult.Type.BLOCK
 				&& bhr.getBlockPos().equals(pos)) {
-			PENDING_AXIS.put(id, bhr.getDirection().getAxis());
+			PENDING_FACE.put(id, bhr.getDirection());
 		} else {
-			PENDING_AXIS.remove(id);
+			PENDING_FACE.remove(id);
 		}
 	}
 
 	private static void mineExtra(ServerLevel level, ServerPlayer player, BlockPos center) {
 		UUID id = player.getUUID();
-		Direction.Axis axis = PENDING_AXIS.remove(id);
-		if (axis == null || !ENABLED_3X3.contains(id)) return;
+		Direction face = PENDING_FACE.remove(id);
+		if (face == null || !ENABLED_3X3.contains(id)) return;
 		if (player.isShiftKeyDown()) return;                         // sneaking = single block
+
+		Direction.Axis axis = face.getAxis();
+		Direction dig = face.getOpposite();                          // the direction "into" the mined block
 
 		breakingExtra = true;
 		try {
-			for (int i = -1; i <= 1; i++) {
-				for (int j = -1; j <= 1; j++) {
-					if (i == 0 && j == 0) continue;
-					if (!player.getMainHandItem().is(ItemTags.PICKAXES)) return;   // pickaxe broke or swapped
+			for (int k = 0; k < DEPTH; k++) {
+				BlockPos base = center.relative(dig, k);
+				for (int i = -1; i <= 1; i++) {
+					for (int j = -1; j <= 1; j++) {
+						if (k == 0 && i == 0 && j == 0) continue;     // the block the game already broke
+						if (!player.getMainHandItem().is(ItemTags.PICKAXES)) return;   // pickaxe broke or swapped
 
-					// Flat 3x3 plane, perpendicular to the face that was mined.
-					BlockPos np = switch (axis) {
-						case Y -> center.offset(i, 0, j);   // mining up/down: horizontal layer
-						case X -> center.offset(0, i, j);   // mining east/west wall
-						default -> center.offset(i, j, 0);  // mining north/south wall
-					};
+						// Flat 3x3 plane, perpendicular to the face that was mined.
+						BlockPos np = switch (axis) {
+							case Y -> base.offset(i, 0, j);   // mining up/down: horizontal layer
+							case X -> base.offset(0, i, j);   // mining east/west wall
+							default -> base.offset(i, j, 0);  // mining north/south wall
+						};
 
-					BlockState ns = level.getBlockState(np);
-					if (ns.isAir()) continue;
-					if (!ns.is(BlockTags.MINEABLE_WITH_PICKAXE)) continue;
-					if (ns.getDestroySpeed(level, np) < 0) continue;      // bedrock etc.
-					if (ns.hasBlockEntity()) continue;                    // chests, spawners... stay safe
+						BlockState ns = level.getBlockState(np);
+						if (ns.isAir()) continue;
+						if (!ns.is(BlockTags.MINEABLE_WITH_PICKAXE)) continue;
+						if (ns.getDestroySpeed(level, np) < 0) continue;      // bedrock etc.
+						if (ns.hasBlockEntity()) continue;                    // chests, spawners... stay safe
 
-					player.gameMode.destroyBlock(np);                     // real break: drops, enchants, tool damage
+						player.gameMode.destroyBlock(np);                     // real break: drops, enchants, tool damage
+					}
 				}
 			}
 		} finally {
@@ -252,13 +259,14 @@ public class ExampleMod implements ModInitializer {
 
 		activeJob = new Job(level, ox, oy, oz, s);
 		nextAllowed = System.currentTimeMillis() + COOLDOWN_MS;
-		LOGGER.info("Placing fake base '{}' ({}x{}x{}, {} containers) at {} {} {}",
-				file.getFileName(), s.w(), s.h(), s.d(), s.tiles().size(), ox, oy, oz);
+		LOGGER.info("Placing fake base '{}' ({}x{}x{}, {} containers, {} entities) at {} {} {}",
+				file.getFileName(), s.w(), s.h(), s.d(), s.tiles().size(), s.ents().size(), ox, oy, oz);
 		return true;
 	}
 
 	// Step 1: clears and places the blocks a few thousand per tick.
-	// Step 2: fills chests/barrels/etc. with their saved contents, a few per tick.
+	// Step 2: fills chests/barrels/etc. with their saved contents.
+	// Step 3: spawns armor stands and other entities.
 	private static void tickJob() {
 		Job job = activeJob;
 		if (job == null) return;
@@ -282,30 +290,60 @@ public class ExampleMod implements ModInitializer {
 		}
 
 		List<Tile> tiles = job.s.tiles();
-		if (job.tileNext < tiles.size()) {
+		List<Ent> ents = job.s.ents();
+		if (job.tileNext < tiles.size() || job.entNext < ents.size()) {
 			if (job.source == null) {
 				job.source = job.level.getServer().createCommandSourceStack()
 						.withLevel(job.level)
 						.withSuppressedOutput();
 			}
 			int budget = TILES_PER_TICK;
+
 			while (budget-- > 0 && job.tileNext < tiles.size()) {
 				Tile t = tiles.get(job.tileNext++);
 				String cmd = "data merge block " + (job.ox + t.x()) + " " + (job.oy + t.y()) + " "
 						+ (job.oz + t.z()) + " " + t.snbt();
-				try {
-					job.level.getServer().getCommands().performPrefixedCommand(job.source, cmd);
-				} catch (Exception e) {
-					if (job.tileErrors++ < 3) {
-						LOGGER.warn("Could not apply container data: {}", e.toString());
-					}
-				}
+				runCommand(job, cmd, "container data");
 			}
-			if (job.tileNext < tiles.size()) return;
+
+			while (budget > 0 && job.entNext < ents.size()) {
+				budget--;
+				Ent e = ents.get(job.entNext++);
+				double ax = job.ox + e.x();
+				double ay = job.oy + e.y();
+				double az = job.oz + e.z();
+				String snbt = e.snbt();
+				if (e.hanging()) {
+					// item frames / paintings need the block position they hang on
+					String bp = "block_pos:[I;" + (int) Math.floor(ax) + "," + (int) Math.floor(ay) + ","
+							+ (int) Math.floor(az) + "]";
+					snbt = snbt.length() > 2
+							? snbt.substring(0, snbt.length() - 1) + "," + bp + "}"
+							: "{" + bp + "}";
+				}
+				String cmd = "summon " + e.type() + " " + fmt(ax) + " " + fmt(ay) + " " + fmt(az) + " " + snbt;
+				runCommand(job, cmd, "entity " + e.type());
+			}
+
+			if (job.tileNext < tiles.size() || job.entNext < ents.size()) return;
 		}
 
 		activeJob = null;
 		nextAllowed = System.currentTimeMillis() + COOLDOWN_MS;
+	}
+
+	private static void runCommand(Job job, String cmd, String what) {
+		try {
+			job.level.getServer().getCommands().performPrefixedCommand(job.source, cmd);
+		} catch (Exception ex) {
+			if (job.errors++ < 3) {
+				LOGGER.warn("Could not apply {}: {}", what, ex.toString());
+			}
+		}
+	}
+
+	private static String fmt(double v) {
+		return String.format(Locale.ROOT, "%.4f", v);
 	}
 
 	// ------------------------------------------------------------------ data types
@@ -316,7 +354,8 @@ public class ExampleMod implements ModInitializer {
 		final Schem s;
 		int next = 0;
 		int tileNext = 0;
-		int tileErrors = 0;
+		int entNext = 0;
+		int errors = 0;
 		CommandSourceStack source = null;
 
 		Job(ServerLevel level, int ox, int oy, int oz, Schem s) {
@@ -330,10 +369,13 @@ public class ExampleMod implements ModInitializer {
 
 	private record Tile(int x, int y, int z, String snbt) {}
 
-	private record Schem(int w, int h, int d, BlockState[] states, List<Tile> tiles) {}
+	// x/y/z are relative to the lowest corner of the whole schematic
+	private record Ent(String type, double x, double y, double z, String snbt, boolean hanging) {}
 
-	private record Region(int ox, int oy, int oz, int ax, int ay, int az, long[] data,
-						  List<Object> palette, List<Object> tiles) {}
+	private record Schem(int w, int h, int d, BlockState[] states, List<Tile> tiles, List<Ent> ents) {}
+
+	private record Region(int ox, int oy, int oz, int rawX, int rawY, int rawZ, int ax, int ay, int az,
+						  long[] data, List<Object> palette, List<Object> tiles, List<Object> entities) {}
 
 	// ------------------------------------------------------------------ .litematic reader
 
@@ -366,18 +408,19 @@ public class ExampleMod implements ModInitializer {
 			int ax = Math.abs(sx), ay = Math.abs(sy), az = Math.abs(sz);
 			if (ax == 0 || ay == 0 || az == 0) continue;
 
+			int rawX = num(pos.get("x")), rawY = num(pos.get("y")), rawZ = num(pos.get("z"));
+
 			// Negative sizes mean the region extends backwards from its position.
-			int ox = num(pos.get("x")) + (sx < 0 ? sx + 1 : 0);
-			int oy = num(pos.get("y")) + (sy < 0 ? sy + 1 : 0);
-			int oz = num(pos.get("z")) + (sz < 0 ? sz + 1 : 0);
+			int ox = rawX + (sx < 0 ? sx + 1 : 0);
+			int oy = rawY + (sy < 0 ? sy + 1 : 0);
+			int oz = rawZ + (sz < 0 ? sz + 1 : 0);
 
 			long[] data = reg.get("BlockStates") instanceof long[] a ? a : null;
 			List<Object> palette = asList(reg.get("BlockStatePalette"));
 			if (data == null || palette == null || palette.isEmpty()) continue;
 
-			List<Object> tileList = asList(reg.get("TileEntities"));
-
-			list.add(new Region(ox, oy, oz, ax, ay, az, data, palette, tileList));
+			list.add(new Region(ox, oy, oz, rawX, rawY, rawZ, ax, ay, az, data, palette,
+					asList(reg.get("TileEntities")), asList(reg.get("Entities"))));
 			minX = Math.min(minX, ox);
 			minY = Math.min(minY, oy);
 			minZ = Math.min(minZ, oz);
@@ -398,6 +441,7 @@ public class ExampleMod implements ModInitializer {
 		BlockState[] out = new BlockState[w * h * d];
 		Arrays.fill(out, air);
 		List<Tile> tiles = new ArrayList<>();
+		List<Ent> ents = new ArrayList<>();
 
 		for (Region r : list) {
 			BlockState[] pal = new BlockState[r.palette().size()];
@@ -444,8 +488,38 @@ public class ExampleMod implements ModInitializer {
 					tiles.add(new Tile(r.ox() - minX + tx, r.oy() - minY + ty, r.oz() - minZ + tz, sb.toString()));
 				}
 			}
+
+			// Entities (armor stands, item frames, paintings...). Positions are relative to the region position.
+			if (r.entities() != null) {
+				for (Object eo : r.entities()) {
+					Map<String, Object> en = asMap(eo);
+					if (en == null) continue;
+					if (!(en.get("id") instanceof String etype)) continue;
+					List<Object> pp = asList(en.get("Pos"));
+					if (pp == null || pp.size() < 3) continue;
+
+					double ex = (r.rawX() - minX) + dbl(pp.get(0));
+					double ey = (r.rawY() - minY) + dbl(pp.get(1));
+					double ez = (r.rawZ() - minZ) + dbl(pp.get(2));
+
+					Map<String, Object> copy = new HashMap<>(en);
+					copy.remove("id");
+					copy.remove("Pos");
+					copy.remove("UUID");
+					boolean hanging = copy.containsKey("block_pos") || copy.containsKey("TileX");
+					copy.remove("block_pos");
+					copy.remove("TileX");
+					copy.remove("TileY");
+					copy.remove("TileZ");
+					upgradeItems(copy);
+
+					StringBuilder sb = new StringBuilder();
+					writeSnbt(copy, sb);
+					ents.add(new Ent(etype, ex, ey, ez, sb.toString(), hanging));
+				}
+			}
 		}
-		return new Schem(w, h, d, out, tiles);
+		return new Schem(w, h, d, out, tiles, ents);
 	}
 
 	// Old schematics store item counts as "Count" (byte); current Minecraft wants "count" (int).
@@ -506,7 +580,7 @@ public class ExampleMod implements ModInitializer {
 		return (int) (((arr[a] >>> off) | (arr[b] << firstBits)) & mask);
 	}
 
-	// ------------------------------------------------------------------ NBT -> SNBT text (for the /data command)
+	// ------------------------------------------------------------------ NBT -> SNBT text (for the /data and /summon commands)
 
 	private static void writeSnbt(Object o, StringBuilder sb) {
 		if (o instanceof Byte bv) {
@@ -644,5 +718,9 @@ public class ExampleMod implements ModInitializer {
 
 	private static int num(Object o) {
 		return o instanceof Number n ? n.intValue() : 0;
+	}
+
+	private static double dbl(Object o) {
+		return o instanceof Number n ? n.doubleValue() : 0.0;
 	}
 }
