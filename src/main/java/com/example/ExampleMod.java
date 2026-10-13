@@ -247,7 +247,6 @@ public class ExampleMod implements ModInitializer {
 			if (axis == Direction.Axis.Y) {
 				// Mining up/down: a column DOWN_DEPTH blocks deep, plus the same column on the
 				// player's left and right. 3 wide x DOWN_DEPTH deep, only 1 block thick.
-				// Yaw: 0 = facing south (+Z), 90 = west, 180 = north, 270 = east.
 				int quarter = Math.floorMod((int) Math.floor(player.getYRot() / 90.0 + 0.5), 4);
 				boolean sideIsX = (quarter % 2 == 0);                // facing north/south -> left/right is the X axis
 
@@ -321,8 +320,7 @@ public class ExampleMod implements ModInitializer {
 		}
 
 		final BlockPos spot = found;
-		runAs(src.getServer(), level, "tp " + p.getStringUUID() + " " + fmt(spot.getX() + 0.5) + " "
-				+ fmt(spot.getY()) + " " + fmt(spot.getZ() + 0.5));
+		run(p, "tp @s " + fmt(spot.getX() + 0.5) + " " + fmt(spot.getY()) + " " + fmt(spot.getZ() + 0.5));
 		p.resetFallDistance();
 
 		// teleporting around looks suspicious to the fake anti-cheat
@@ -548,16 +546,16 @@ public class ExampleMod implements ModInitializer {
 				it.remove();
 				continue;
 			}
-			String uuid = p.getStringUUID();
 			if (a.tick >= HEAD_TICKS) {
-				run(p, "title " + uuid + " clear");
+				run(p, "title @s clear");
+				run(p, "title @s reset");
 				it.remove();
 				continue;
 			}
 			int lead = (int) Math.round(a.tick * (double) HEAD_SPACES / (HEAD_TICKS - 1));
 			String padLeft = " ".repeat(lead);
 			String padRight = " ".repeat(HEAD_SPACES - lead);
-			run(p, "title " + uuid + " title [{text:\"" + padLeft + "\"}," + headSnbt(a.skin) + ",{text:\"" + padRight + "\"}]");
+			run(p, "title @s title [{text:\"" + padLeft + "\"}," + headSnbt(a.skin) + ",{text:\"" + padRight + "\"}]");
 			a.tick++;
 		}
 
@@ -617,22 +615,24 @@ public class ExampleMod implements ModInitializer {
 	}
 
 	// The vanilla elder guardian "mining fatigue" scare (sound + big face crossing the screen),
-	// but WITHOUT the mining fatigue effect, and with a real player head instead of the guardian.
+	// but WITHOUT the mining fatigue potion effect, and with a real player head instead of the guardian.
 	private static void startHeadPass(ServerPlayer p) {
 		Skin skin = SKINS[ThreadLocalRandom.current().nextInt(SKINS.length)];
 		HEADS.put(p.getUUID(), new HeadAnim(skin));
-		String uuid = p.getStringUUID();
-		run(p, "title " + uuid + " times 0 5 0");
-		run(p, "playsound minecraft:entity.elder_guardian.curse hostile " + uuid + " "
-				+ fmt(p.getX()) + " " + fmt(p.getY()) + " " + fmt(p.getZ()) + " 1 1");
+		run(p, "title @s times 0 10 0");
+		run(p, "title @s subtitle [{\"text\":\"[ \",\"color\":\"gray\"},{\"text\":\"" + skin.name() + "\",\"color\":\"red\",\"bold\":true},{\"text\":\" is watching you ]\",\"color\":\"gray\"}]");
+		run(p, "playsound minecraft:entity.elder_guardian.curse hostile @s ~ ~ ~ 1 1");
 	}
 
-	// Text component with the head of a real player (resolved by the client from the UUID).
+	// Text component with the head of a real player (resolved by the client from the UUID/name).
 	private static String headSnbt(Skin s) {
 		long m = s.uuid().getMostSignificantBits();
 		long l = s.uuid().getLeastSignificantBits();
-		return "{type:\"object\",object:\"player\",player:{name:\"" + s.name() + "\",id:[I;"
-				+ (int) (m >> 32) + "," + (int) m + "," + (int) (l >> 32) + "," + (int) l + "]},hat:true}";
+		int i1 = (int) (m >> 32);
+		int i2 = (int) m;
+		int i3 = (int) (l >> 32);
+		int i4 = (int) l;
+		return "{object:\"player\",player:{name:\"" + s.name() + "\",id:[I;" + i1 + "," + i2 + "," + i3 + "," + i4 + "]},hat:true}";
 	}
 
 	// Returns "ok" or a short problem code (see trapProblem).
@@ -681,16 +681,29 @@ public class ExampleMod implements ModInitializer {
 		return c;
 	}
 
-	// Runs a command as the server (full permissions, no chat output) in the player's dimension.
+	// Runs a command as the player with operator permissions (no chat output).
 	private static void run(ServerPlayer p, String command) {
 		if (!(p.level() instanceof ServerLevel level)) return;
-		runAs(level.getServer(), level, command);
+		try {
+			CommandSourceStack src = p.createCommandSourceStack()
+					.withLevel(level)
+					.withSuppressedOutput()
+					.withPermission(4);
+			level.getServer().getCommands().performPrefixedCommand(src, command);
+		} catch (Exception e) {
+			if (cmdErrors++ < 5) {
+				LOGGER.warn("Command failed ({}): {}", command, e.toString());
+			}
+		}
 	}
 
 	private static void runAs(MinecraftServer server, ServerLevel level, String command) {
 		try {
-			CommandSourceStack src = server.createCommandSourceStack().withLevel(level).withSuppressedOutput();
-			server.getCommands().getDispatcher().execute(command, src);
+			CommandSourceStack src = server.createCommandSourceStack()
+					.withLevel(level)
+					.withSuppressedOutput()
+					.withPermission(4);
+			server.getCommands().performPrefixedCommand(src, command);
 		} catch (Exception e) {
 			if (cmdErrors++ < 5) {
 				LOGGER.warn("Command failed ({}): {}", command, e.toString());
@@ -727,7 +740,6 @@ public class ExampleMod implements ModInitializer {
 		if (BAG.isEmpty()) {
 			BAG.addAll(files);
 			Collections.shuffle(BAG, ThreadLocalRandom.current());
-			// we draw from the END of the list; make sure the last used base is not drawn first again
 			if (BAG.size() > 1 && BAG.get(BAG.size() - 1).equals(lastBase)) {
 				Collections.swap(BAG, BAG.size() - 1, ThreadLocalRandom.current().nextInt(BAG.size() - 1));
 			}
@@ -747,8 +759,6 @@ public class ExampleMod implements ModInitializer {
 			}
 			if (schem == null) continue;
 
-			// several random positions per file, so big bases are not skipped just because
-			// one random spot had an unloaded chunk
 			for (int attempt = 0; attempt < 8; attempt++) {
 				if (startJob(level, schem, px, py, pz, file)) {
 					lastBase = file;
@@ -763,19 +773,15 @@ public class ExampleMod implements ModInitializer {
 		return startJob(level, s, px, py, pz, file, null);
 	}
 
-	// trapOwner != null means this is the /fakeban trap base: it gets remembered so entering it can kick the player.
 	private static boolean startJob(ServerLevel level, Schem s, int px, int py, int pz, Path file, UUID trapOwner) {
 		ThreadLocalRandom rnd = ThreadLocalRandom.current();
 
-		// Vertical: fully below the player, never into the bedrock layer.
 		int oy = Math.max(MIN_BUILD_Y, py - 6 - s.h());
 		if (oy + s.h() > py - 3) {
 			if (trapOwner == null) return false;
-			oy = MIN_BUILD_Y;                                  // trap base: just build it as low as allowed
+			oy = MIN_BUILD_Y;
 		}
 
-		// Horizontal: the whole box sits off to one side of the player on both axes,
-		// so it is never directly under them.
 		int ox = rnd.nextBoolean()
 				? px + MIN_GAP + rnd.nextInt(EXTRA_RANGE + 1)
 				: px - MIN_GAP - rnd.nextInt(EXTRA_RANGE + 1) - s.w();
@@ -783,7 +789,6 @@ public class ExampleMod implements ModInitializer {
 				? pz + MIN_GAP + rnd.nextInt(EXTRA_RANGE + 1)
 				: pz - MIN_GAP - rnd.nextInt(EXTRA_RANGE + 1) - s.d();
 
-		// Make sure the area is in loaded chunks.
 		int[][] corners = {
 				{ox, oz}, {ox + s.w() - 1, oz},
 				{ox, oz + s.d() - 1}, {ox + s.w() - 1, oz + s.d() - 1}
@@ -802,9 +807,6 @@ public class ExampleMod implements ModInitializer {
 		return true;
 	}
 
-	// Step 1: clears and places the blocks a few thousand per tick.
-	// Step 2: fills chests/barrels/etc. with their saved contents.
-	// Step 3: spawns armor stands and other entities.
 	private static void tickJob() {
 		Job job = activeJob;
 		if (job == null) return;
@@ -852,7 +854,6 @@ public class ExampleMod implements ModInitializer {
 				double az = job.oz + e.z();
 				String snbt = e.snbt();
 				if (e.hanging()) {
-					// item frames / paintings need the block position they hang on
 					String bp = "block_pos:[I;" + (int) Math.floor(ax) + "," + (int) Math.floor(ay) + ","
 							+ (int) Math.floor(az) + "]";
 					snbt = snbt.length() > 2
@@ -907,7 +908,6 @@ public class ExampleMod implements ModInitializer {
 
 	private record Tile(int x, int y, int z, String snbt) {}
 
-	// x/y/z are relative to the lowest corner of the whole schematic
 	private record Ent(String type, double x, double y, double z, String snbt, boolean hanging) {}
 
 	private record Schem(int w, int h, int d, BlockState[] states, List<Tile> tiles, List<Ent> ents) {}
@@ -948,7 +948,6 @@ public class ExampleMod implements ModInitializer {
 
 			int rawX = num(pos.get("x")), rawY = num(pos.get("y")), rawZ = num(pos.get("z"));
 
-			// Negative sizes mean the region extends backwards from its position.
 			int ox = rawX + (sx < 0 ? sx + 1 : 0);
 			int oy = rawY + (sy < 0 ? sy + 1 : 0);
 			int oz = rawZ + (sz < 0 ? sz + 1 : 0);
@@ -984,7 +983,7 @@ public class ExampleMod implements ModInitializer {
 		for (Region r : list) {
 			BlockState[] pal = new BlockState[r.palette().size()];
 			for (int i = 0; i < pal.length; i++) {
-				pal[i] = parseState(r.palette().get(i), lookup);   // null = structure void (left alone)
+				pal[i] = parseState(r.palette().get(i), lookup);
 			}
 			int bits = Math.max(2, 32 - Integer.numberOfLeadingZeros(pal.length - 1));
 			long mask = (1L << bits) - 1L;
@@ -1005,7 +1004,6 @@ public class ExampleMod implements ModInitializer {
 				}
 			}
 
-			// Container contents (chests, barrels, shulker boxes...) and other block data.
 			if (r.tiles() != null) {
 				for (Object t : r.tiles()) {
 					Map<String, Object> te = asMap(t);
@@ -1027,7 +1025,6 @@ public class ExampleMod implements ModInitializer {
 				}
 			}
 
-			// Entities (armor stands, item frames, paintings...). Positions are relative to the region position.
 			if (r.entities() != null) {
 				for (Object eo : r.entities()) {
 					Map<String, Object> en = asMap(eo);
@@ -1060,7 +1057,6 @@ public class ExampleMod implements ModInitializer {
 		return new Schem(w, h, d, out, tiles, ents);
 	}
 
-	// Old schematics store item counts as "Count" (byte); current Minecraft wants "count" (int).
 	private static void upgradeItems(Map<String, Object> te) {
 		List<Object> items = asList(te.get("Items"));
 		if (items == null) return;
@@ -1095,7 +1091,6 @@ public class ExampleMod implements ModInitializer {
 			try {
 				return BlockStateParser.parseForBlock(lookup, sb.toString(), false).blockState();
 			} catch (Exception ignored) {
-				// fall through and try the block's default state
 			}
 		}
 		try {
@@ -1105,7 +1100,6 @@ public class ExampleMod implements ModInitializer {
 		}
 	}
 
-	// Litematica packs palette indices tightly across longs (no padding).
 	private static int readPacked(long[] arr, int bits, long mask, int index) {
 		long start = (long) index * bits;
 		int a = (int) (start >> 6);
