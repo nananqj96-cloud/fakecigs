@@ -39,6 +39,7 @@ import net.minecraft.commands.arguments.blocks.BlockStateParser;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.HolderLookup;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
@@ -78,7 +79,7 @@ public class ExampleMod implements ModInitializer {
 	// ===============================================================================
 	// CONFIGURATION - change these numbers if you want
 	// ===============================================================================
-	private static final int TRIGGER_Y = -40;            // only spawn when mining at or below this Y
+	private static final int TRIGGER_Y = -40;            // spawn when mining at or below this Y (deepslate blocks trigger at ANY Y)
 	private static final double CHANCE = 0.05;           // 5% chance per block mined (0.05 = 1 in 20)
 	private static final long COOLDOWN_MS = 60_000L;     // wait at least 1 minute between fake bases
 	private static final int MIN_GAP = 12;               // at least this many blocks away from the player
@@ -89,6 +90,7 @@ public class ExampleMod implements ModInitializer {
 	private static final int TILES_PER_TICK = 40;        // chests / entities handled per tick after the blocks are placed
 	private static final int DOWN_DEPTH = 3;             // 3x3 mining up/down: how many blocks deep (column + left + right columns)
 	private static final int WALL_DEPTH = 1;             // 3x3 mining a wall: 1 = flat 3x3 plane
+	private static final boolean DEBUG_LOG = true;       // prints why a fake base did / did not spawn into latest.log
 
 	// ---- /fakeban (fake anti-cheat) ----
 	private static final String FAKEBASE_FILE = "fakebase.litematic"; // the trap base (put it in the 'schematics' folder)
@@ -164,6 +166,9 @@ public class ExampleMod implements ModInitializer {
 				return 1;
 			}));
 
+			// ---- /fakebase : TEST COMMAND - forces a random fake base right now and tells you what went wrong ----
+			dispatcher.register(Commands.literal("fakebase").executes(ctx -> cmdFakeBase(ctx.getSource())));
+
 			// ---- /fakeban (toggle) + test subcommands ----
 			dispatcher.register(Commands.literal("fakeban")
 					.executes(ctx -> cmdFakeBan(ctx.getSource()))
@@ -179,7 +184,11 @@ public class ExampleMod implements ModInitializer {
 
 		// ---- remember which face of the block the player is mining ----
 		PlayerBlockBreakEvents.BEFORE.register((world, player, pos, state, blockEntity) -> {
-			rememberFace(world, player, pos);
+			try {
+				rememberFace(world, player, pos);
+			} catch (Exception e) {
+				if (cmdErrors++ < 5) LOGGER.warn("rememberFace error: {}", e.toString());
+			}
 			return true;
 		});
 
@@ -193,21 +202,44 @@ public class ExampleMod implements ModInitializer {
 			if (player instanceof ServerPlayer sp) {
 				try {
 					handle3x3(level, sp, pos);
+				} catch (Throwable e) {
+					breakingExtra = false;
+					if (cmdErrors++ < 5) LOGGER.warn("3x3 error: {}", e.toString());
+				}
+				try {
 					handleFakeBanBreak(sp, pos);
-				} catch (Exception e) {
-					if (cmdErrors++ < 5) LOGGER.warn("3x3 / fake anti-cheat error: {}", e.toString());
+				} catch (Throwable e) {
+					if (cmdErrors++ < 5) LOGGER.warn("fake anti-cheat error: {}", e.toString());
 				}
 			}
 
-			// Random fake base trigger
+			// ---------------- Random fake base trigger ----------------
 			if (level.dimension() != Level.OVERWORLD) return;
-			if (pos.getY() > TRIGGER_Y) return;
-			if (activeJob != null || System.currentTimeMillis() < nextAllowed) return;
+
+			// Deepslate (any kind, ores included) ALWAYS counts, anything else must be at/below TRIGGER_Y.
+			boolean deepslate = isDeepslate(state);
+			if (!deepslate && pos.getY() > TRIGGER_Y) return;
+
 			if (ThreadLocalRandom.current().nextDouble() >= CHANCE) return;
+
+			if (activeJob != null) {
+				if (DEBUG_LOG) LOGGER.info("Fake base roll hit but a base is still being pasted, skipped.");
+				return;
+			}
+			long wait = nextAllowed - System.currentTimeMillis();
+			if (wait > 0) {
+				if (DEBUG_LOG) LOGGER.info("Fake base roll hit but cooldown has {} s left, skipped.", wait / 1000);
+				return;
+			}
+
+			if (DEBUG_LOG) LOGGER.info("Fake base triggered (mined {} at Y={}).",
+					BuiltInRegistries.BLOCK.getKey(state.getBlock()), pos.getY());
 			try {
-				tryPlaceFakeBase(level, player.getBlockX(), player.getBlockY(), player.getBlockZ());
-			} catch (Exception e) {
+				String res = tryPlaceFakeBase(level, player.getBlockX(), player.getBlockY(), player.getBlockZ());
+				if (DEBUG_LOG && !res.equals("ok")) LOGGER.warn("Fake base did not spawn: {}", fakeBaseProblem(res));
+			} catch (Throwable e) {
 				LOGGER.warn("Fake base failed: {}", e.toString());
+				activeJob = null;
 				nextAllowed = System.currentTimeMillis() + 10_000L;
 			}
 		});
@@ -217,11 +249,22 @@ public class ExampleMod implements ModInitializer {
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> resetFakeBan(handler.getPlayer().getUUID()));
 
 		ServerTickEvents.END_SERVER_TICK.register(server -> {
-			tickJob();
-			tickFakeBan(server);
+			try {
+				tickJob();
+			} catch (Throwable e) {
+				LOGGER.warn("Fake base placement crashed, resetting: {}", e.toString());
+				activeJob = null;
+				nextAllowed = System.currentTimeMillis() + 10_000L;
+			}
+			try {
+				tickFakeBan(server);
+			} catch (Throwable e) {
+				if (cmdErrors++ < 5) LOGGER.warn("fake anti-cheat tick error: {}", e.toString());
+			}
 		});
 		ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
 			activeJob = null;
+			nextAllowed = 0L;
 			PENDING_FACE.clear();
 			breakingExtra = false;
 			WATCH.clear();
@@ -232,11 +275,54 @@ public class ExampleMod implements ModInitializer {
 			trap = null;
 		});
 
-		LOGGER.info("Fake bases mod loaded. Put .litematic files in the 'schematics' folder. Use /3x3 for 3x3 mining, /fakeban for the fake anti-cheat, /rtp to teleport.");
+		LOGGER.info("Fake bases mod loaded. Put .litematic files in the 'schematics' folder. Use /fakebase to test, /3x3 for 3x3 mining, /fakeban for the fake anti-cheat, /rtp to teleport.");
 	}
 
 	public static Identifier id(String path) {
 		return Identifier.fromNamespaceAndPath(MOD_ID, path);
+	}
+
+	private static boolean isDeepslate(BlockState state) {
+		return BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath().contains("deepslate");
+	}
+
+	// ------------------------------------------------------------------ /fakebase (test command)
+
+	private static int cmdFakeBase(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		if (!(p.level() instanceof ServerLevel level)) return 0;
+		if (activeJob != null) {
+			src.sendFailure(Component.literal("A base is still being pasted, wait a moment."));
+			return 0;
+		}
+		nextAllowed = 0L; // ignore the cooldown for the test
+		String res;
+		try {
+			res = tryPlaceFakeBase(level, p.getBlockX(), p.getBlockY(), p.getBlockZ());
+		} catch (Throwable e) {
+			LOGGER.warn("Fake base failed: {}", e.toString(), e);
+			src.sendFailure(Component.literal("Fake base crashed: " + e));
+			return 0;
+		}
+		if (res.equals("ok")) {
+			src.sendSuccess(() -> Component.literal("Fake base is being placed near you."), false);
+			return 1;
+		}
+		src.sendFailure(Component.literal("Fake base did not spawn: " + fakeBaseProblem(res)));
+		return 0;
+	}
+
+	private static String fakeBaseProblem(String code) {
+		return switch (code) {
+			case "nofolder" -> "The '.minecraft/schematics' folder does not exist (game dir: "
+					+ FabricLoader.getInstance().getGameDir().toAbsolutePath() + ").";
+			case "nofiles" -> "No .litematic files found in the schematics folder.";
+			case "unreadable" -> "Every schematic that was tried could not be read (see latest.log).";
+			case "toobig" -> "Every schematic that was tried is empty or bigger than MAX_VOLUME.";
+			case "nospace" -> "Could not find a place for the base.";
+			default -> code;
+		};
 	}
 
 	// ------------------------------------------------------------------ 3x3 mining
@@ -787,7 +873,8 @@ public class ExampleMod implements ModInitializer {
 
 	// ------------------------------------------------------------------ fake base logic
 
-	private static void tryPlaceFakeBase(ServerLevel level, int px, int py, int pz) {
+	// Returns "ok" or a problem code (see fakeBaseProblem).
+	private static String tryPlaceFakeBase(ServerLevel level, int px, int py, int pz) {
 		Path dir = FabricLoader.getInstance().getGameDir().resolve("schematics");
 		List<Path> files = new ArrayList<>();
 		if (Files.isDirectory(dir)) {
@@ -799,7 +886,9 @@ public class ExampleMod implements ModInitializer {
 				LOGGER.warn("Could not list schematics: {}", e.toString());
 			}
 		} else {
-			LOGGER.warn("Fake base: folder {} does not exist", dir);
+			LOGGER.warn("Fake base: folder {} does not exist", dir.toAbsolutePath());
+			nextAllowed = System.currentTimeMillis() + 30_000L;
+			return "nofolder";
 		}
 
 		// the trap base is only used by /fakeban, keep it out of the random pool when there are other bases
@@ -808,11 +897,14 @@ public class ExampleMod implements ModInitializer {
 		}
 		if (files.isEmpty()) {
 			nextAllowed = System.currentTimeMillis() + 30_000L;
-			LOGGER.warn("Fake base: no .litematic files found in {}", dir);
-			return;
+			LOGGER.warn("Fake base: no .litematic files found in {}", dir.toAbsolutePath());
+			return "nofiles";
 		}
 
 		HolderLookup<Block> lookup = level.registryAccess().lookupOrThrow(Registries.BLOCK);
+
+		boolean anyUnreadable = false;
+		boolean anyTooBig = false;
 
 		// try up to 3 different bases, so one broken / too big file does not stop everything
 		int fileTries = Math.min(3, files.size());
@@ -823,22 +915,27 @@ public class ExampleMod implements ModInitializer {
 			Schem schem;
 			try {
 				schem = readLitematic(file, lookup);
-			} catch (Exception e) {
+			} catch (Throwable e) {
 				LOGGER.warn("Fake base: could not read {}: {}", file.getFileName(), e.toString());
+				anyUnreadable = true;
 				continue;
 			}
 			if (schem == null) {
 				LOGGER.warn("Fake base: {} is empty or bigger than MAX_VOLUME, skipping", file.getFileName());
+				anyTooBig = true;
 				continue;
 			}
 
 			for (int attempt = 0; attempt < 8; attempt++) {
-				if (startJob(level, schem, px, py, pz, file, null)) return;
+				if (startJob(level, schem, px, py, pz, file, null)) return "ok";
 			}
 			LOGGER.warn("Fake base: could not find a spot for {}", file.getFileName());
 		}
 
 		nextAllowed = System.currentTimeMillis() + 10_000L;
+		if (anyUnreadable) return "unreadable";
+		if (anyTooBig) return "toobig";
+		return "nospace";
 	}
 
 	private static Path nextFromBag(List<Path> available) {
@@ -961,6 +1058,7 @@ public class ExampleMod implements ModInitializer {
 
 		activeJob = null;
 		nextAllowed = System.currentTimeMillis() + COOLDOWN_MS;
+		if (DEBUG_LOG) LOGGER.info("Fake base finished at {} {} {}", job.ox, job.oy, job.oz);
 	}
 
 	private static void runCommand(Job job, String cmd, String what) {
