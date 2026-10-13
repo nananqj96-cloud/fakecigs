@@ -109,6 +109,10 @@ public class ExampleMod implements ModInitializer {
 	private static Job activeJob = null;
 	private static long nextAllowed = 0L;
 
+	// shuffle bag for the random fake bases (every base is used once before any repeats)
+	private static final List<Path> BAG = new ArrayList<>();
+	private static Path lastBase = null;
+
 	// 3x3 mining state (only touched on the server thread)
 	private static final Set<UUID> ENABLED_3X3 = new HashSet<>();
 	private static final Map<UUID, Direction> PENDING_FACE = new HashMap<>();
@@ -718,12 +722,22 @@ public class ExampleMod implements ModInitializer {
 			return;
 		}
 
-		Collections.shuffle(files);
+		// ---- shuffle bag: drop deleted files, refill + reshuffle when empty ----
+		BAG.removeIf(p -> !files.contains(p));
+		if (BAG.isEmpty()) {
+			BAG.addAll(files);
+			Collections.shuffle(BAG, ThreadLocalRandom.current());
+			// we draw from the END of the list; make sure the last used base is not drawn first again
+			if (BAG.size() > 1 && BAG.get(BAG.size() - 1).equals(lastBase)) {
+				Collections.swap(BAG, BAG.size() - 1, ThreadLocalRandom.current().nextInt(BAG.size() - 1));
+			}
+		}
+
 		HolderLookup<Block> lookup = level.registryAccess().lookupOrThrow(Registries.BLOCK);
 
-		int tries = Math.min(3, files.size());
-		for (int i = 0; i < tries; i++) {
-			Path file = files.get(i);
+		int fileTries = Math.min(5, BAG.size());
+		for (int i = 0; i < fileTries && !BAG.isEmpty(); i++) {
+			Path file = BAG.remove(BAG.size() - 1);
 			Schem schem;
 			try {
 				schem = readLitematic(file, lookup);
@@ -732,7 +746,15 @@ public class ExampleMod implements ModInitializer {
 				continue;
 			}
 			if (schem == null) continue;
-			if (startJob(level, schem, px, py, pz, file)) return;
+
+			// several random positions per file, so big bases are not skipped just because
+			// one random spot had an unloaded chunk
+			for (int attempt = 0; attempt < 8; attempt++) {
+				if (startJob(level, schem, px, py, pz, file)) {
+					lastBase = file;
+					return;
+				}
+			}
 		}
 		nextAllowed = System.currentTimeMillis() + 10_000L;
 	}
