@@ -22,9 +22,16 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
 
+import com.mojang.authlib.GameProfile;
+import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
+import com.mojang.brigadier.tree.CommandNode;
 
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.api.EnvType;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
@@ -33,12 +40,19 @@ import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.loader.api.FabricLoader;
 
 import net.minecraft.ChatFormatting;
+import net.minecraft.client.KeyMapping;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.resources.sounds.SimpleSoundInstance;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.blocks.BlockStateParser;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.HolderLookup;
+import net.minecraft.core.Rotations;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
@@ -47,9 +61,16 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.permissions.PermissionSet;
+import net.minecraft.sounds.SoundEvents;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.ItemTags;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.decoration.ArmorStand;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ResolvableProfile;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
@@ -57,22 +78,13 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
-
-import com.mojang.authlib.GameProfile;
-import net.minecraft.core.Rotations;
-import net.minecraft.core.component.DataComponents;
-import net.minecraft.server.permissions.PermissionSet;
-import net.minecraft.sounds.SoundEvents;
-import net.minecraft.world.entity.EquipmentSlot;
-import net.minecraft.world.entity.decoration.ArmorStand;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
-import net.minecraft.world.item.component.ResolvableProfile;
 import net.minecraft.world.phys.Vec3;
+
+import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class ExampleMod implements ModInitializer {
+public class ExampleMod implements ModInitializer, ClientModInitializer {
 	public static final String MOD_ID = "modid";
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
@@ -132,7 +144,7 @@ public class ExampleMod implements ModInitializer {
 	private static final Set<UUID> ENABLED_3X3 = new HashSet<>();
 	private static final Map<UUID, Direction> PENDING_FACE = new HashMap<>();
 	private static boolean breakingExtra = false;
-	private static int extraBroken = 0;                      // how many extra blocks the last 3x3 break removed
+	private static int extraBroken = 0;
 
 	// fake anti-cheat state (only touched on the server thread)
 	private static final Set<UUID> ENABLED_FAKEBAN = new HashSet<>();
@@ -146,9 +158,36 @@ public class ExampleMod implements ModInitializer {
 			new Skin("WiZoX", UUID.fromString("77482a7d-e661-4927-8641-ee5c62245dd1"))
 	};
 
+	// ------------------------------------------------------------------ ClickGUI System
+	public static final class GuiCommand {
+		public final String command;
+		public final String label;
+		public final String description;
+		public final boolean isToggle;
+
+		public GuiCommand(String command, String label, String description, boolean isToggle) {
+			this.command = command;
+			this.label = label;
+			this.description = description;
+			this.isToggle = isToggle;
+		}
+	}
+
+	public static final List<GuiCommand> REGISTERED_COMMANDS = new ArrayList<>();
+	private static KeyMapping guiKeyMapping = null;
+	private static boolean clientInitialized = false;
+
 	@Override
 	public void onInitialize() {
+		// Populate initial known commands
+		registerDefaultGuiCommands();
+
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+			Set<String> before = new HashSet<>();
+			for (CommandNode<CommandSourceStack> node : dispatcher.getRoot().getChildren()) {
+				before.add(node.getName());
+			}
+
 			// ---- /3x3 command (toggle) ----
 			dispatcher.register(Commands.literal("3x3").executes(ctx -> {
 				CommandSourceStack src = ctx.getSource();
@@ -167,7 +206,7 @@ public class ExampleMod implements ModInitializer {
 				return 1;
 			}));
 
-			// ---- /fakebase : TEST COMMAND - forces a random fake base right now and tells you what went wrong ----
+			// ---- /fakebase : TEST COMMAND ----
 			dispatcher.register(Commands.literal("fakebase").executes(ctx -> cmdFakeBase(ctx.getSource())));
 
 			// ---- /fakeban (toggle) + test subcommands ----
@@ -181,6 +220,13 @@ public class ExampleMod implements ModInitializer {
 
 			// ---- /rtp ----
 			dispatcher.register(Commands.literal("rtp").executes(ctx -> cmdRtp(ctx.getSource())));
+
+			// Auto-discover all mod commands (including any command added in the future!)
+			for (CommandNode<CommandSourceStack> node : dispatcher.getRoot().getChildren()) {
+				if (!before.contains(node.getName())) {
+					autoDiscoverNode(node, "");
+				}
+			}
 		});
 
 		// ---- remember which face of the block the player is mining ----
@@ -195,11 +241,10 @@ public class ExampleMod implements ModInitializer {
 
 		// ---- after a block is broken: 3x3 extras + fake anti-cheat + fake base trigger ----
 		PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, blockEntity) -> {
-			if (breakingExtra) return;                                // ignore blocks broken by 3x3 itself
+			if (breakingExtra) return;
 			if (!(world instanceof ServerLevel level)) return;
-			if (level.getServer().isDedicatedServer()) return;       // singleplayer / integrated server only
+			if (level.getServer().isDedicatedServer()) return;
 
-			// These two must never be able to stop the fake base from spawning, even if they throw an error.
 			if (player instanceof ServerPlayer sp) {
 				try {
 					handle3x3(level, sp, pos);
@@ -216,8 +261,6 @@ public class ExampleMod implements ModInitializer {
 
 			// ---------------- Random fake base trigger ----------------
 			if (level.dimension() != Level.OVERWORLD) return;
-
-			// Any block mined below BASE_TRIGGER_Y (Y -10) counts, no matter what block it is.
 			if (pos.getY() >= BASE_TRIGGER_Y) return;
 
 			if (CHANCE < 1.0 && ThreadLocalRandom.current().nextDouble() >= CHANCE) return;
@@ -262,6 +305,7 @@ public class ExampleMod implements ModInitializer {
 				if (cmdErrors++ < 5) LOGGER.warn("fake anti-cheat tick error: {}", e.toString());
 			}
 		});
+
 		ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
 			activeJob = null;
 			nextAllowed = 0L;
@@ -275,7 +319,318 @@ public class ExampleMod implements ModInitializer {
 			trap = null;
 		});
 
-		LOGGER.info("Fake bases mod loaded. Put .litematic files in the 'schematics' folder. Use /fakebase to test, /3x3 for 3x3 mining, /fakeban for the fake anti-cheat, /rtp to teleport.");
+		// Ensure client setup initializes on client environments
+		if (FabricLoader.getInstance().getEnvironmentType() == EnvType.CLIENT) {
+			initClient();
+		}
+
+		LOGGER.info("Fake bases mod loaded. Press [INSERT] to open ClickGUI. Use /fakebase to test, /3x3 for 3x3 mining, /fakeban for fake anti-cheat, /rtp to teleport.");
+	}
+
+	@Override
+	public void onInitializeClient() {
+		initClient();
+	}
+
+	private static synchronized void initClient() {
+		if (clientInitialized) return;
+		clientInitialized = true;
+
+		guiKeyMapping = KeyBindingHelper.registerKeyBinding(new KeyMapping(
+				"key." + MOD_ID + ".gui",
+				InputConstants.Type.KEYSYM,
+				GLFW.GLFW_KEY_INSERT,
+				"category." + MOD_ID
+		));
+
+		ClientTickEvents.END_CLIENT_TICK.register(client -> {
+			while (guiKeyMapping.consumeClick()) {
+				if (client.screen == null) {
+					client.setScreen(new ClickGuiScreen());
+				} else if (client.screen instanceof ClickGuiScreen) {
+					client.setScreen(null);
+				}
+			}
+		});
+	}
+
+	private static void registerDefaultGuiCommands() {
+		addGuiCommand("3x3", "3x3 Mining", "Toggles 3x3 pickaxe mining mode (hold sneak to mine 1 block)", true);
+		addGuiCommand("fakeban", "Fake Anti-Cheat", "Toggles fake anti-cheat watcher and traps", true);
+		addGuiCommand("fakebase", "Spawn Fake Base", "Forces a random fake base schematic to paste near you", false);
+		addGuiCommand("rtp", "Random Teleport", "Teleports you to a random safe surface location", false);
+		addGuiCommand("fakeban status", "Anti-Cheat Status", "Prints your violation level and stage into chat", false);
+		addGuiCommand("fakeban watch", "Trigger Watch Scare", "Simulates an admin watching you with the head jumpscare", false);
+		addGuiCommand("fakeban trap", "Spawn Trap Base", "Pastes the fakeban trap base near you", false);
+		addGuiCommand("fakeban kick", "Test Fake Ban Kick", "Disconnects you with a fake permanent ban screen", false);
+		addGuiCommand("fakeban reset", "Reset Violations", "Resets your fake anti-cheat violation level to 0", false);
+	}
+
+	private static void addGuiCommand(String cmd, String label, String desc, boolean isToggle) {
+		for (GuiCommand c : REGISTERED_COMMANDS) {
+			if (c.command.equalsIgnoreCase(cmd)) return;
+		}
+		REGISTERED_COMMANDS.add(new GuiCommand(cmd, label, desc, isToggle));
+	}
+
+	private static void autoDiscoverNode(CommandNode<CommandSourceStack> node, String prefix) {
+		String cmdName = prefix.isEmpty() ? node.getName() : prefix + " " + node.getName();
+		if (node.getCommand() != null) {
+			boolean isToggle = cmdName.equalsIgnoreCase("3x3") || cmdName.equalsIgnoreCase("fakeban")
+					|| cmdName.toLowerCase(Locale.ROOT).contains("toggle");
+			addGuiCommand(cmdName, formatCmdLabel(cmdName), "Executes /" + cmdName, isToggle);
+		}
+		for (CommandNode<CommandSourceStack> child : node.getChildren()) {
+			autoDiscoverNode(child, cmdName);
+		}
+	}
+
+	private static String formatCmdLabel(String cmd) {
+		String[] parts = cmd.split(" ");
+		StringBuilder sb = new StringBuilder();
+		for (String p : parts) {
+			if (p.isEmpty()) continue;
+			if (sb.length() > 0) sb.append(" ");
+			sb.append(Character.toUpperCase(p.charAt(0))).append(p.substring(1));
+		}
+		return sb.toString();
+	}
+
+	public static void executeGuiCommand(String cmd) {
+		Minecraft mc = Minecraft.getInstance();
+		if (mc.player != null && mc.player.connection != null) {
+			String clean = cmd.startsWith("/") ? cmd.substring(1).trim() : cmd.trim();
+			mc.player.connection.sendCommand(clean);
+		}
+	}
+
+	public static boolean isCommandActive(String cmd) {
+		Minecraft mc = Minecraft.getInstance();
+		if (mc.player == null) return false;
+		UUID id = mc.player.getUUID();
+		String clean = cmd.startsWith("/") ? cmd.substring(1).trim() : cmd.trim();
+		if (clean.equalsIgnoreCase("3x3")) return ENABLED_3X3.contains(id);
+		if (clean.equalsIgnoreCase("fakeban")) return ENABLED_FAKEBAN.contains(id);
+		return false;
+	}
+
+	// ===============================================================================
+	// ClickGUI Screen Implementation
+	// ===============================================================================
+	public static class ClickGuiScreen extends Screen {
+		private static int winX = 60;
+		private static int winY = 40;
+		private static final int WIN_WIDTH = 250;
+		private static final int WIN_HEIGHT = 300;
+		private static final int HEADER_HEIGHT = 24;
+		private static final int ITEM_HEIGHT = 26;
+
+		private boolean dragging = false;
+		private int dragOffsetX = 0;
+		private int dragOffsetY = 0;
+		private int scrollOffset = 0;
+
+		public ClickGuiScreen() {
+			super(Component.literal("Mod ClickGUI"));
+		}
+
+		@Override
+		public boolean isPauseScreen() {
+			return false; // keeps the game world rendering and ticking behind the GUI
+		}
+
+		@Override
+		public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+			if (keyCode == GLFW.GLFW_KEY_INSERT || keyCode == GLFW.GLFW_KEY_ESCAPE) {
+				this.onClose();
+				return true;
+			}
+			return super.keyPressed(keyCode, scanCode, modifiers);
+		}
+
+		@Override
+		public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+			// Dim background slightly
+			graphics.fill(0, 0, this.width, this.height, 0x55000000);
+
+			int x = winX;
+			int y = winY;
+			int w = WIN_WIDTH;
+			int h = WIN_HEIGHT;
+
+			// Window Background (Deep obsidian)
+			graphics.fill(x, y, x + w, y + h, 0xEE12151C);
+			// Outer Border
+			graphics.fill(x - 1, y - 1, x + w + 1, y, 0xFF282C3D);
+			graphics.fill(x - 1, y + h, x + w + 1, y + h + 1, 0xFF282C3D);
+			graphics.fill(x - 1, y, x, y + h, 0xFF282C3D);
+			graphics.fill(x + w, y, x + w + 1, y + h, 0xFF282C3D);
+
+			// Top Accent Stripe (Neon Cyan)
+			graphics.fill(x, y, x + w, y + 2, 0xFF00E5FF);
+
+			// Header Bar
+			graphics.fill(x, y + 2, x + w, y + HEADER_HEIGHT, 0xFF181C26);
+			graphics.drawString(this.font, Component.literal("⚡ COMMANDS & MODULES"), x + 10, y + 8, 0xFFFFFFFF, false);
+
+			// Close button [X]
+			boolean hoverClose = mouseX >= x + w - 20 && mouseX <= x + w - 4 && mouseY >= y + 4 && mouseY <= y + 20;
+			graphics.fill(x + w - 20, y + 5, x + w - 5, y + 19, hoverClose ? 0xFFFF4757 : 0x33FFFFFF);
+			graphics.drawString(this.font, Component.literal("✕"), x + w - 16, y + 8, hoverClose ? 0xFFFFFFFF : 0xFFB0B4C0, false);
+
+			// Subtitle / Info
+			graphics.fill(x, y + HEADER_HEIGHT, x + w, y + HEADER_HEIGHT + 14, 0xFF141720);
+			graphics.drawString(this.font, Component.literal("[Insert] Close | Drag header to move"), x + 8, y + HEADER_HEIGHT + 3, 0xFF71788E, false);
+
+			// Command List Area
+			int contentTop = y + HEADER_HEIGHT + 16;
+			int contentHeight = h - (HEADER_HEIGHT + 20);
+			int visibleCount = contentHeight / ITEM_HEIGHT;
+			int maxScroll = Math.max(0, REGISTERED_COMMANDS.size() - visibleCount);
+			scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
+
+			// Render items
+			GuiCommand hoveredCmd = null;
+			for (int i = 0; i < visibleCount; i++) {
+				int index = i + scrollOffset;
+				if (index >= REGISTERED_COMMANDS.size()) break;
+				GuiCommand cmd = REGISTERED_COMMANDS.get(index);
+
+				int itemY = contentTop + (i * ITEM_HEIGHT);
+				boolean hovered = mouseX >= x + 8 && mouseX <= x + w - 8 && mouseY >= itemY && mouseY < itemY + ITEM_HEIGHT - 3;
+				if (hovered) hoveredCmd = cmd;
+
+				// Row Background
+				int rowBg = hovered ? 0xFF242A38 : 0xFF191D26;
+				graphics.fill(x + 8, itemY, x + w - 8, itemY + ITEM_HEIGHT - 3, rowBg);
+
+				// Highlight border on hover
+				if (hovered) {
+					graphics.fill(x + 8, itemY, x + 9, itemY + ITEM_HEIGHT - 3, 0xFF00E5FF);
+				}
+
+				// Command Name
+				graphics.drawString(this.font, Component.literal("/" + cmd.command), x + 14, itemY + 6, 0xFFE2E6F0, false);
+
+				// State / Action Badge on the right
+				if (cmd.isToggle) {
+					boolean on = isCommandActive(cmd.command);
+					int badgeBg = on ? 0x442ECC71 : 0x44E74C3C;
+					int badgeBorder = on ? 0xFF2ECC71 : 0xFFE74C3C;
+					int badgeText = on ? 0xFF2ECC71 : 0xFFE74C3C;
+					String label = on ? "ON" : "OFF";
+
+					int badgeW = 34;
+					int badgeX = x + w - badgeW - 14;
+					graphics.fill(badgeX, itemY + 4, badgeX + badgeW, itemY + ITEM_HEIGHT - 7, badgeBg);
+					graphics.fill(badgeX, itemY + 4, badgeX + badgeW, itemY + 5, badgeBorder);
+					graphics.fill(badgeX, itemY + ITEM_HEIGHT - 8, badgeX + badgeW, itemY + ITEM_HEIGHT - 7, badgeBorder);
+					graphics.drawString(this.font, Component.literal(label), badgeX + (on ? 10 : 8), itemY + 6, badgeText, false);
+				} else {
+					int badgeW = 34;
+					int badgeX = x + w - badgeW - 14;
+					graphics.fill(badgeX, itemY + 4, badgeX + badgeW, itemY + ITEM_HEIGHT - 7, 0x4400E5FF);
+					graphics.fill(badgeX, itemY + 4, badgeX + badgeW, itemY + 5, 0xFF00E5FF);
+					graphics.fill(badgeX, itemY + ITEM_HEIGHT - 8, badgeX + badgeW, itemY + ITEM_HEIGHT - 7, 0xFF00E5FF);
+					graphics.drawString(this.font, Component.literal("RUN"), badgeX + 8, itemY + 6, 0xFF00E5FF, false);
+				}
+			}
+
+			// Scrollbar indicator
+			if (maxScroll > 0) {
+				int barTrackH = contentHeight - 6;
+				int barThumbH = Math.max(16, barTrackH * visibleCount / REGISTERED_COMMANDS.size());
+				int barThumbY = contentTop + 3 + (barTrackH - barThumbH) * scrollOffset / maxScroll;
+				graphics.fill(x + w - 6, contentTop + 3, x + w - 3, contentTop + 3 + barTrackH, 0xFF141720);
+				graphics.fill(x + w - 6, barThumbY, x + w - 3, barThumbY + barThumbH, 0xFF00E5FF);
+			}
+
+			// Hover Tooltip
+			if (hoveredCmd != null) {
+				graphics.renderTooltip(this.font, Component.literal(hoveredCmd.description), mouseX, mouseY);
+			}
+
+			super.render(graphics, mouseX, mouseY, partialTick);
+		}
+
+		@Override
+		public boolean mouseClicked(double mouseX, double mouseY, int button) {
+			if (button == 0) {
+				int x = winX;
+				int y = winY;
+				int w = WIN_WIDTH;
+				int h = WIN_HEIGHT;
+
+				// Close button clicked
+				if (mouseX >= x + w - 20 && mouseX <= x + w - 4 && mouseY >= y + 4 && mouseY <= y + 20) {
+					playClickSound();
+					this.onClose();
+					return true;
+				}
+
+				// Header dragging
+				if (mouseX >= x && mouseX <= x + w && mouseY >= y && mouseY <= y + HEADER_HEIGHT) {
+					dragging = true;
+					dragOffsetX = (int) mouseX - winX;
+					dragOffsetY = (int) mouseY - winY;
+					return true;
+				}
+
+				// Command clicked
+				int contentTop = y + HEADER_HEIGHT + 16;
+				int contentHeight = h - (HEADER_HEIGHT + 20);
+				int visibleCount = contentHeight / ITEM_HEIGHT;
+
+				for (int i = 0; i < visibleCount; i++) {
+					int index = i + scrollOffset;
+					if (index >= REGISTERED_COMMANDS.size()) break;
+
+					int itemY = contentTop + (i * ITEM_HEIGHT);
+					if (mouseX >= x + 8 && mouseX <= x + w - 8 && mouseY >= itemY && mouseY < itemY + ITEM_HEIGHT - 3) {
+						GuiCommand cmd = REGISTERED_COMMANDS.get(index);
+						playClickSound();
+						executeGuiCommand(cmd.command);
+						return true;
+					}
+				}
+			}
+			return super.mouseClicked(mouseX, mouseY, button);
+		}
+
+		@Override
+		public boolean mouseReleased(double mouseX, double mouseY, int button) {
+			if (button == 0) {
+				dragging = false;
+			}
+			return super.mouseReleased(mouseX, mouseY, button);
+		}
+
+		@Override
+		public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
+			if (dragging) {
+				winX = (int) mouseX - dragOffsetX;
+				winY = (int) mouseY - dragOffsetY;
+				return true;
+			}
+			return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+		}
+
+		@Override
+		public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
+			if (verticalAmount != 0) {
+				scrollOffset -= (int) Math.signum(verticalAmount);
+				int contentHeight = WIN_HEIGHT - (HEADER_HEIGHT + 20);
+				int visibleCount = contentHeight / ITEM_HEIGHT;
+				int maxScroll = Math.max(0, REGISTERED_COMMANDS.size() - visibleCount);
+				scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
+				return true;
+			}
+			return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount);
+		}
+
+		private static void playClickSound() {
+			Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, 1.0F));
+		}
 	}
 
 	public static Identifier id(String path) {
@@ -296,7 +651,7 @@ public class ExampleMod implements ModInitializer {
 			src.sendFailure(Component.literal("A base is still being pasted, wait a moment."));
 			return 0;
 		}
-		nextAllowed = 0L; // ignore the cooldown for the test
+		nextAllowed = 0L;
 		String res;
 		try {
 			res = tryPlaceFakeBase(level, p.getBlockX(), p.getBlockY(), p.getBlockZ());
@@ -383,7 +738,7 @@ public class ExampleMod implements ModInitializer {
 				if (!level.isInWorldBounds(target)) continue;
 				BlockState st = level.getBlockState(target);
 				if (st.isAir()) continue;
-				if (st.getDestroySpeed(level, target) < 0) continue; // bedrock etc.
+				if (st.getDestroySpeed(level, target) < 0) continue;
 				if (p.gameMode.destroyBlock(target)) {
 					extraBroken++;
 				}
@@ -416,7 +771,7 @@ public class ExampleMod implements ModInitializer {
 			int x = (int) Math.round(p.getX() + Math.cos(angle) * dist);
 			int z = (int) Math.round(p.getZ() + Math.sin(angle) * dist);
 
-			level.getChunk(x >> 4, z >> 4); // force load so heightmap is populated
+			level.getChunk(x >> 4, z >> 4);
 			int surfaceY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
 			if (surfaceY <= level.getMinY()) continue;
 
@@ -431,10 +786,9 @@ public class ExampleMod implements ModInitializer {
 			p.teleportTo(level, x + 0.5, surfaceY, z + 0.5, Set.of(), p.getYRot(), p.getXRot(), false);
 			run(p, "playsound minecraft:item.chorus_fruit.teleport player @s ~ ~ ~ 1 1");
 
-			// teleporting instantly looks like a cheat to the fake anti-cheat
 			Watch w = WATCH.computeIfAbsent(p.getUUID(), k -> new Watch());
 			w.vl += VL_RTP;
-			w.hasLast = false; // don't count the teleport itself as movement speed
+			w.hasLast = false;
 
 			src.sendSuccess(() -> Component.literal("Teleported to " + x + " " + surfaceY + " " + z + "."), false);
 			return 1;
@@ -447,8 +801,8 @@ public class ExampleMod implements ModInitializer {
 	// ------------------------------------------------------------------ fake anti-cheat (/fakeban)
 
 	private static final class Watch {
-		double vl = 0.0;                  // violation level, like a real anti-cheat
-		int stage = 0;                    // 0 = clean, 1 = "admin" watched you, 2 = trap base placed
+		double vl = 0.0;
+		int stage = 0;
 		int watchedTick = 0;
 		boolean trapGaveUp = false;
 		final ArrayDeque<Integer> breaks = new ArrayDeque<>();
@@ -641,8 +995,6 @@ public class ExampleMod implements ModInitializer {
 				continue;
 			}
 
-			// Elder Guardian jumpscare animation:
-			// Head sweeps smoothly across the player's screen while staring into their eyes.
 			double progress = (double) a.tick / Math.max(1, HEAD_TICKS - 1);
 			Vec3 eye = p.getEyePosition();
 			float yaw = p.getYRot();
@@ -660,10 +1012,8 @@ public class ExampleMod implements ModInitializer {
 			Vec3 right = new Vec3(Math.cos(yawRad), 0.0, Math.sin(yawRad)).normalize();
 			Vec3 up = right.cross(forward).normalize();
 
-			// Sweeps across field of view (high-right down to center-left)
 			double screenX = 0.55 - 1.10 * progress;
 			double screenY = 0.45 - 0.90 * progress;
-			// Depth curve: zooms in close at the midpoint (0.85 blocks from face), then sweeps away
 			double dist = 0.85 + 0.65 * Math.pow(progress - 0.5, 2) * 4.0;
 
 			Vec3 targetHead = eye.add(forward.scale(dist))
@@ -672,7 +1022,6 @@ public class ExampleMod implements ModInitializer {
 
 			double standY = targetHead.y - 1.70;
 
-			// Rotate the head to stare directly into the player's eyes
 			Vec3 toEye = eye.subtract(targetHead).normalize();
 			double headYaw = Math.toDegrees(Math.atan2(-toEye.x, toEye.z));
 			double headPitch = Math.toDegrees(Math.asin(-toEye.y));
@@ -719,7 +1068,6 @@ public class ExampleMod implements ModInitializer {
 			w.lastZ = p.getZ();
 			w.hasLast = true;
 
-			// decay
 			w.vl = Math.max(0.0, w.vl - VL_DECAY_PER_SEC);
 
 			// stage 0 -> 1: the admin looks at you
@@ -731,7 +1079,7 @@ public class ExampleMod implements ModInitializer {
 				continue;
 			}
 
-			// stage 1 -> 2: you kept cheating, the trap base appears
+			// stage 1 -> 2: trap base appears
 			if (w.stage == 1 && !w.trapGaveUp && w.vl >= VL_TRAP && now - w.watchedTick >= TRAP_DELAY_TICKS) {
 				String result = placeTrap(p);
 				if (result.equals("ok")) {
@@ -740,13 +1088,10 @@ public class ExampleMod implements ModInitializer {
 					w.trapGaveUp = true;
 					LOGGER.warn("Fake anti-cheat trap base skipped: {}", trapProblem(result));
 				}
-				// "busy" / "nospace": simply try again next second
 			}
 		}
 	}
 
-	// The vanilla elder guardian "mining fatigue" scare (sound + big face crossing the screen),
-	// but WITHOUT the mining fatigue potion effect, and with a real player head instead of the guardian.
 	private static void startHeadPass(ServerPlayer p) {
 		if (!(p.level() instanceof ServerLevel level)) return;
 		HeadAnim oldAnim = HEADS.remove(p.getUUID());
@@ -756,7 +1101,7 @@ public class ExampleMod implements ModInitializer {
 
 		Skin skin = SKINS[ThreadLocalRandom.current().nextInt(SKINS.length)];
 
-		// 1. Play Elder Guardian curse jumpscare sound directly to the player
+		// 1. Play jumpscare sound
 		p.playSound(SoundEvents.ELDER_GUARDIAN_CURSE, 1.0f, 1.0f);
 		run(p, "playsound minecraft:entity.elder_guardian.curse hostile @s ~ ~ ~ 1 1");
 
@@ -765,7 +1110,7 @@ public class ExampleMod implements ModInitializer {
 		run(p, "title @s subtitle [{\"text\":\"[ \",\"color\":\"gray\"},{\"text\":\"" + skin.name() + "\",\"color\":\"red\",\"bold\":true},{\"text\":\" is watching you ]\",\"color\":\"gray\"}]");
 		run(p, "title @s title {\"text\":\"\"}");
 
-		// 3. Spawn an invisible ArmorStand wearing the configured UUID skin head right in front of the player's face
+		// 3. Spawn invisible ArmorStand wearing player head
 		Vec3 eye = p.getEyePosition();
 		ArmorStand stand = new ArmorStand(level, eye.x, eye.y - 1.70, eye.z);
 
@@ -784,18 +1129,6 @@ public class ExampleMod implements ModInitializer {
 		HEADS.put(p.getUUID(), new HeadAnim(skin, stand));
 	}
 
-	// Text component with the head of a real player (resolved by the client from the UUID/name).
-	private static String headSnbt(Skin s) {
-		long m = s.uuid().getMostSignificantBits();
-		long l = s.uuid().getLeastSignificantBits();
-		int i1 = (int) (m >> 32);
-		int i2 = (int) m;
-		int i3 = (int) (l >> 32);
-		int i4 = (int) l;
-		return "{object:\"player\",player:{name:\"" + s.name() + "\",id:[I;" + i1 + "," + i2 + "," + i3 + "," + i4 + "]},hat:true}";
-	}
-
-	// Returns "ok" or a short problem code (see trapProblem).
 	private static String placeTrap(ServerPlayer p) {
 		if (!(p.level() instanceof ServerLevel level)) return "nospace";
 		if (activeJob != null) return "busy";
@@ -814,12 +1147,14 @@ public class ExampleMod implements ModInitializer {
 		if (schem == null) return "toobig";
 
 		for (int i = 0; i < 8; i++) {
-			if (startJob(level, schem, p.getBlockX(), p.getBlockY(), p.getBlockZ(), file, p.getUUID())) return "ok";
+			if (startJob(level, schem, p.getBlockX(), p.getBlockY(), p.getBlockZ(), file, p.getUUID())) {
+				startHeadPass(p);
+				return "ok";
+			}
 		}
 		return "nospace";
 	}
 
-	// Simulated multiplayer ban: the disconnect screen with a fake permanent ban message.
 	private static void fakeBanKick(ServerPlayer p) {
 		resetFakeBan(p.getUUID());
 		p.connection.disconnect(banMessage());
@@ -841,7 +1176,6 @@ public class ExampleMod implements ModInitializer {
 		return c;
 	}
 
-	// Runs a command as the player with operator permissions (no chat output).
 	private static void run(ServerPlayer p, String command) {
 		if (!(p.level() instanceof ServerLevel level)) return;
 		try {
@@ -857,23 +1191,8 @@ public class ExampleMod implements ModInitializer {
 		}
 	}
 
-	private static void runAs(MinecraftServer server, ServerLevel level, String command) {
-		try {
-			CommandSourceStack src = server.createCommandSourceStack()
-					.withLevel(level)
-					.withSuppressedOutput()
-					.withPermission(PermissionSet.ALL_PERMISSIONS);
-			server.getCommands().performPrefixedCommand(src, command);
-		} catch (Exception e) {
-			if (cmdErrors++ < 5) {
-				LOGGER.warn("Command failed ({}): {}", command, e.toString());
-			}
-		}
-	}
-
 	// ------------------------------------------------------------------ fake base logic
 
-	// Returns "ok" or a problem code (see fakeBaseProblem).
 	private static String tryPlaceFakeBase(ServerLevel level, int px, int py, int pz) {
 		Path dir = FabricLoader.getInstance().getGameDir().resolve("schematics");
 		List<Path> files = new ArrayList<>();
@@ -891,7 +1210,6 @@ public class ExampleMod implements ModInitializer {
 			return "nofolder";
 		}
 
-		// the trap base is only used by /fakeban, keep it out of the random pool when there are other bases
 		if (files.size() > 1) {
 			files.removeIf(f -> f.getFileName().toString().equalsIgnoreCase(FAKEBASE_FILE));
 		}
@@ -906,7 +1224,6 @@ public class ExampleMod implements ModInitializer {
 		boolean anyUnreadable = false;
 		boolean anyTooBig = false;
 
-		// try up to 3 different bases, so one broken / too big file does not stop everything
 		int fileTries = Math.min(3, files.size());
 		for (int i = 0; i < fileTries; i++) {
 			Path file = nextFromBag(files);
@@ -961,7 +1278,6 @@ public class ExampleMod implements ModInitializer {
 		int maxOY = Math.min(py + 4, level.getMaxY() - s.h());
 		int minOY = Math.max(py - s.h() - 4, MIN_BUILD_Y);
 		if (maxOY < minOY) {
-			// base is too tall for the space: build it as low as allowed
 			minOY = MIN_BUILD_Y;
 			maxOY = MIN_BUILD_Y;
 		}
@@ -975,7 +1291,6 @@ public class ExampleMod implements ModInitializer {
 				? pz + MIN_GAP + rnd.nextInt(EXTRA_RANGE + 1)
 				: pz - MIN_GAP - rnd.nextInt(EXTRA_RANGE + 1) - s.d();
 
-		// Load every chunk the base will cover (so it never fails because a chunk was not loaded yet).
 		for (int cx = ox >> 4; cx <= (ox + s.w() - 1) >> 4; cx++) {
 			for (int cz = oz >> 4; cz <= (oz + s.d() - 1) >> 4; cz++) {
 				level.getChunk(cx, cz);
@@ -1179,7 +1494,7 @@ public class ExampleMod implements ModInitializer {
 					for (int x = 0; x < r.ax(); x++) {
 						int palIdx = readPacked(r.data(), bits, mask, (y * r.az() + z) * r.ax() + x);
 						BlockState st = palIdx < pal.length ? pal[palIdx] : air;
-						if (st == null) continue; // structure void
+						if (st == null) continue;
 
 						int gx = r.ox() - minX + x;
 						int gy = r.oy() - minY + y;
@@ -1296,7 +1611,7 @@ public class ExampleMod implements ModInitializer {
 		return (int) (((arr[a] >>> off) | (arr[b] << firstBits)) & mask);
 	}
 
-	// ------------------------------------------------------------------ NBT -> SNBT text (for the /data and /summon commands)
+	// ------------------------------------------------------------------ NBT -> SNBT text
 
 	private static void writeSnbt(Object o, StringBuilder sb) {
 		if (o instanceof Byte bv) {
@@ -1373,7 +1688,7 @@ public class ExampleMod implements ModInitializer {
 	private static Object readNamedTag(DataInputStream in) throws IOException {
 		byte type = in.readByte();
 		if (type == 0) return null;
-		in.readUTF(); // name
+		in.readUTF();
 		return readPayload(type, in);
 	}
 
