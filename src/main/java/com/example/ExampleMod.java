@@ -65,7 +65,8 @@ public class ExampleMod implements ModInitializer {
 	private static final int MAX_VOLUME = 3_000_000;     // skip schematics bigger than this many blocks
 	private static final int BLOCKS_PER_TICK = 6000;     // placement speed (lower = less lag)
 	private static final int TILES_PER_TICK = 40;        // chests / entities handled per tick after the blocks are placed
-	private static final int DEPTH = 1;                  // 3x3 mining depth: 1 = flat 3x3 layer (like the real plugin), 3 = 3x3x3
+	private static final int DOWN_DEPTH = 3;             // 3x3 mining up/down: how many blocks deep (column + left + right columns)
+	private static final int WALL_DEPTH = 1;             // 3x3 mining a wall: 1 = flat 3x3 plane
 	// ===============================================================================
 
 	private static Job activeJob = null;
@@ -164,33 +165,53 @@ public class ExampleMod implements ModInitializer {
 
 		breakingExtra = true;
 		try {
-			for (int k = 0; k < DEPTH; k++) {
-				BlockPos base = center.relative(dig, k);
-				for (int i = -1; i <= 1; i++) {
-					for (int j = -1; j <= 1; j++) {
-						if (k == 0 && i == 0 && j == 0) continue;     // the block the game already broke
-						if (!player.getMainHandItem().is(ItemTags.PICKAXES)) return;   // pickaxe broke or swapped
+			if (axis == Direction.Axis.Y) {
+				// Mining up/down: a column DOWN_DEPTH blocks deep, plus the same column on the
+				// player's left and right. 3 wide x DOWN_DEPTH deep, only 1 block thick.
+				// Yaw: 0 = facing south (+Z), 90 = west, 180 = north, 270 = east.
+				int quarter = Math.floorMod((int) Math.floor(player.getYRot() / 90.0 + 0.5), 4);
+				boolean sideIsX = (quarter % 2 == 0);                // facing north/south -> left/right is the X axis
 
-						// Flat 3x3 plane, perpendicular to the face that was mined.
-						BlockPos np = switch (axis) {
-							case Y -> base.offset(i, 0, j);   // mining up/down: horizontal layer
-							case X -> base.offset(0, i, j);   // mining east/west wall
-							default -> base.offset(i, j, 0);  // mining north/south wall
-						};
-
-						BlockState ns = level.getBlockState(np);
-						if (ns.isAir()) continue;
-						if (!ns.is(BlockTags.MINEABLE_WITH_PICKAXE)) continue;
-						if (ns.getDestroySpeed(level, np) < 0) continue;      // bedrock etc.
-						if (ns.hasBlockEntity()) continue;                    // chests, spawners... stay safe
-
-						player.gameMode.destroyBlock(np);                     // real break: drops, enchants, tool damage
+				for (int k = 0; k < DOWN_DEPTH; k++) {
+					BlockPos base = center.relative(dig, k);
+					for (int i = -1; i <= 1; i++) {
+						if (k == 0 && i == 0) continue;               // the block the game already broke
+						BlockPos np = sideIsX ? base.offset(i, 0, 0) : base.offset(0, 0, i);
+						if (!breakExtra(level, player, np)) return;
+					}
+				}
+			} else {
+				// Mining a wall: flat 3x3 plane facing the player (WALL_DEPTH deep).
+				for (int k = 0; k < WALL_DEPTH; k++) {
+					BlockPos base = center.relative(dig, k);
+					for (int i = -1; i <= 1; i++) {
+						for (int j = -1; j <= 1; j++) {
+							if (k == 0 && i == 0 && j == 0) continue;
+							BlockPos np = (axis == Direction.Axis.X)
+									? base.offset(0, i, j)           // east/west wall
+									: base.offset(i, j, 0);          // north/south wall
+							if (!breakExtra(level, player, np)) return;
+						}
 					}
 				}
 			}
 		} finally {
 			breakingExtra = false;
 		}
+	}
+
+	// Returns false when the pickaxe is gone (stop mining), true otherwise.
+	private static boolean breakExtra(ServerLevel level, ServerPlayer player, BlockPos np) {
+		if (!player.getMainHandItem().is(ItemTags.PICKAXES)) return false;   // pickaxe broke or swapped
+
+		BlockState ns = level.getBlockState(np);
+		if (ns.isAir()) return true;
+		if (!ns.is(BlockTags.MINEABLE_WITH_PICKAXE)) return true;
+		if (ns.getDestroySpeed(level, np) < 0) return true;                  // bedrock etc.
+		if (ns.hasBlockEntity()) return true;                                // chests, spawners... stay safe
+
+		player.gameMode.destroyBlock(np);                                    // real break: drops, enchants, tool damage
+		return true;
 	}
 
 	// ------------------------------------------------------------------ fake base logic
