@@ -189,9 +189,14 @@ public class ExampleMod implements ModInitializer {
 			if (!(world instanceof ServerLevel level)) return;
 			if (level.getServer().isDedicatedServer()) return;       // singleplayer / integrated server only
 
+			// These two must never be able to stop the fake base from spawning, even if they throw an error.
 			if (player instanceof ServerPlayer sp) {
-				handle3x3(level, sp, pos);
-				handleFakeBanBreak(sp, pos);
+				try {
+					handle3x3(level, sp, pos);
+					handleFakeBanBreak(sp, pos);
+				} catch (Exception e) {
+					if (cmdErrors++ < 5) LOGGER.warn("3x3 / fake anti-cheat error: {}", e.toString());
+				}
 			}
 
 			// Random fake base trigger
@@ -199,7 +204,12 @@ public class ExampleMod implements ModInitializer {
 			if (pos.getY() > TRIGGER_Y) return;
 			if (activeJob != null || System.currentTimeMillis() < nextAllowed) return;
 			if (ThreadLocalRandom.current().nextDouble() >= CHANCE) return;
-			tryPlaceFakeBase(level, player.getBlockX(), player.getBlockY(), player.getBlockZ());
+			try {
+				tryPlaceFakeBase(level, player.getBlockX(), player.getBlockY(), player.getBlockZ());
+			} catch (Exception e) {
+				LOGGER.warn("Fake base failed: {}", e.toString());
+				nextAllowed = System.currentTimeMillis() + 10_000L;
+			}
 		});
 
 		// Clean up state when players join / leave
@@ -782,31 +792,53 @@ public class ExampleMod implements ModInitializer {
 		List<Path> files = new ArrayList<>();
 		if (Files.isDirectory(dir)) {
 			try (Stream<Path> s = Files.list(dir)) {
-				s.filter(f -> Files.isRegularFile(f) && f.getFileName().toString().endsWith(".litematic"))
-						.filter(f -> !f.getFileName().toString().equalsIgnoreCase(FAKEBASE_FILE))
+				s.filter(f -> Files.isRegularFile(f)
+						&& f.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".litematic"))
 						.forEach(files::add);
 			} catch (IOException e) {
 				LOGGER.warn("Could not list schematics: {}", e.toString());
 			}
+		} else {
+			LOGGER.warn("Fake base: folder {} does not exist", dir);
 		}
-		if (files.isEmpty()) return;
 
-		Path file = nextFromBag(files);
-		if (file == null) return;
-
-		Schem schem;
-		try {
-			HolderLookup<Block> lookup = level.registryAccess().lookupOrThrow(Registries.BLOCK);
-			schem = readLitematic(file, lookup);
-		} catch (Exception e) {
-			LOGGER.warn("Could not read {}: {}", file.getFileName(), e.toString());
+		// the trap base is only used by /fakeban, keep it out of the random pool when there are other bases
+		if (files.size() > 1) {
+			files.removeIf(f -> f.getFileName().toString().equalsIgnoreCase(FAKEBASE_FILE));
+		}
+		if (files.isEmpty()) {
+			nextAllowed = System.currentTimeMillis() + 30_000L;
+			LOGGER.warn("Fake base: no .litematic files found in {}", dir);
 			return;
 		}
-		if (schem == null) return;
 
-		for (int i = 0; i < 8; i++) {
-			if (startJob(level, schem, px, py, pz, file, null)) return;
+		HolderLookup<Block> lookup = level.registryAccess().lookupOrThrow(Registries.BLOCK);
+
+		// try up to 3 different bases, so one broken / too big file does not stop everything
+		int fileTries = Math.min(3, files.size());
+		for (int i = 0; i < fileTries; i++) {
+			Path file = nextFromBag(files);
+			if (file == null) break;
+
+			Schem schem;
+			try {
+				schem = readLitematic(file, lookup);
+			} catch (Exception e) {
+				LOGGER.warn("Fake base: could not read {}: {}", file.getFileName(), e.toString());
+				continue;
+			}
+			if (schem == null) {
+				LOGGER.warn("Fake base: {} is empty or bigger than MAX_VOLUME, skipping", file.getFileName());
+				continue;
+			}
+
+			for (int attempt = 0; attempt < 8; attempt++) {
+				if (startJob(level, schem, px, py, pz, file, null)) return;
+			}
+			LOGGER.warn("Fake base: could not find a spot for {}", file.getFileName());
 		}
+
+		nextAllowed = System.currentTimeMillis() + 10_000L;
 	}
 
 	private static Path nextFromBag(List<Path> available) {
@@ -820,6 +852,7 @@ public class ExampleMod implements ModInitializer {
 			}
 		}
 
+		if (BAG.isEmpty()) return null;
 		Path picked = BAG.remove(0);
 		lastBase = picked;
 		return picked;
@@ -830,7 +863,11 @@ public class ExampleMod implements ModInitializer {
 
 		int maxOY = Math.min(py + 4, level.getMaxY() - s.h());
 		int minOY = Math.max(py - s.h() - 4, MIN_BUILD_Y);
-		if (maxOY < minOY) return false;
+		if (maxOY < minOY) {
+			// base is too tall for the space: build it as low as allowed
+			minOY = MIN_BUILD_Y;
+			maxOY = MIN_BUILD_Y;
+		}
 		int oy = minOY + rnd.nextInt(maxOY - minOY + 1);
 
 		int ox = rnd.nextBoolean()
@@ -841,12 +878,11 @@ public class ExampleMod implements ModInitializer {
 				? pz + MIN_GAP + rnd.nextInt(EXTRA_RANGE + 1)
 				: pz - MIN_GAP - rnd.nextInt(EXTRA_RANGE + 1) - s.d();
 
-		int[][] corners = {
-				{ox, oz}, {ox + s.w() - 1, oz},
-				{ox, oz + s.d() - 1}, {ox + s.w() - 1, oz + s.d() - 1}
-		};
-		for (int[] c : corners) {
-			if (!level.hasChunk(c[0] >> 4, c[1] >> 4)) return false;
+		// Load every chunk the base will cover (so it never fails because a chunk was not loaded yet).
+		for (int cx = ox >> 4; cx <= (ox + s.w() - 1) >> 4; cx++) {
+			for (int cz = oz >> 4; cz <= (oz + s.d() - 1) >> 4; cz++) {
+				level.getChunk(cx, cz);
+			}
 		}
 
 		activeJob = new Job(level, ox, oy, oz, s);
