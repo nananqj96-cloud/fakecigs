@@ -39,7 +39,6 @@ import net.minecraft.commands.arguments.blocks.BlockStateParser;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.HolderLookup;
-import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
@@ -217,8 +216,8 @@ public class ExampleMod implements ModInitializer {
 			// ---------------- Random fake base trigger ----------------
 			if (level.dimension() != Level.OVERWORLD) return;
 
-			// Any block mined below BASE_TRIGGER_Y (Y -10) counts, no matter what block it is.
-			if (pos.getY() >= BASE_TRIGGER_Y) return;
+			// Any block mined at or below BASE_TRIGGER_Y (Y -10) counts, no matter what block it is.
+			if (pos.getY() > BASE_TRIGGER_Y) return;
 
 			if (ThreadLocalRandom.current().nextDouble() >= CHANCE) return;
 
@@ -232,8 +231,7 @@ public class ExampleMod implements ModInitializer {
 				return;
 			}
 
-			if (DEBUG_LOG) LOGGER.info("Fake base triggered (mined {} at Y={}).",
-					BuiltInRegistries.BLOCK.getKey(state.getBlock()), pos.getY());
+			if (DEBUG_LOG) LOGGER.info("Fake base triggered (mined a block at Y={}).", pos.getY());
 			try {
 				String res = tryPlaceFakeBase(level, player.getBlockX(), player.getBlockY(), player.getBlockZ());
 				if (DEBUG_LOG && !res.equals("ok")) LOGGER.warn("Fake base did not spawn: {}", fakeBaseProblem(res));
@@ -280,10 +278,6 @@ public class ExampleMod implements ModInitializer {
 
 	public static Identifier id(String path) {
 		return Identifier.fromNamespaceAndPath(MOD_ID, path);
-	}
-
-	private static boolean isDeepslate(BlockState state) {
-		return BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath().contains("deepslate");
 	}
 
 	// ------------------------------------------------------------------ /fakebase (test command)
@@ -872,6 +866,7 @@ public class ExampleMod implements ModInitializer {
 	}
 
 	// ------------------------------------------------------------------ fake base logic
+	// (this part is the spawning logic from the WORKING version)
 
 	// Returns "ok" or a problem code (see fakeBaseProblem).
 	private static String tryPlaceFakeBase(ServerLevel level, int px, int py, int pz) {
@@ -879,26 +874,35 @@ public class ExampleMod implements ModInitializer {
 		List<Path> files = new ArrayList<>();
 		if (Files.isDirectory(dir)) {
 			try (Stream<Path> s = Files.list(dir)) {
-				s.filter(f -> Files.isRegularFile(f)
-						&& f.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".litematic"))
+				s.filter(p -> p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".litematic"))
 						.forEach(files::add);
 			} catch (IOException e) {
-				LOGGER.warn("Could not list schematics: {}", e.toString());
+				LOGGER.warn("Could not list schematics folder", e);
+				return "nofolder";
 			}
 		} else {
 			LOGGER.warn("Fake base: folder {} does not exist", dir.toAbsolutePath());
 			nextAllowed = System.currentTimeMillis() + 30_000L;
 			return "nofolder";
 		}
-
 		// the trap base is only used by /fakeban, keep it out of the random pool when there are other bases
 		if (files.size() > 1) {
 			files.removeIf(f -> f.getFileName().toString().equalsIgnoreCase(FAKEBASE_FILE));
 		}
 		if (files.isEmpty()) {
 			nextAllowed = System.currentTimeMillis() + 30_000L;
-			LOGGER.warn("Fake base: no .litematic files found in {}", dir.toAbsolutePath());
+			LOGGER.warn("No .litematic files found in {}", dir.toAbsolutePath());
 			return "nofiles";
+		}
+
+		// ---- shuffle bag: drop deleted files, refill + reshuffle when empty ----
+		BAG.removeIf(p -> !files.contains(p));
+		if (BAG.isEmpty()) {
+			BAG.addAll(files);
+			Collections.shuffle(BAG, ThreadLocalRandom.current());
+			if (BAG.size() > 1 && BAG.get(BAG.size() - 1).equals(lastBase)) {
+				Collections.swap(BAG, BAG.size() - 1, ThreadLocalRandom.current().nextInt(BAG.size() - 1));
+			}
 		}
 
 		HolderLookup<Block> lookup = level.registryAccess().lookupOrThrow(Registries.BLOCK);
@@ -906,80 +910,57 @@ public class ExampleMod implements ModInitializer {
 		boolean anyUnreadable = false;
 		boolean anyTooBig = false;
 
-		// try up to 3 different bases, so one broken / too big file does not stop everything
-		int fileTries = Math.min(3, files.size());
-		for (int i = 0; i < fileTries; i++) {
-			Path file = nextFromBag(files);
-			if (file == null) break;
-
+		int fileTries = Math.min(5, BAG.size());
+		for (int i = 0; i < fileTries && !BAG.isEmpty(); i++) {
+			Path file = BAG.remove(BAG.size() - 1);
 			Schem schem;
 			try {
 				schem = readLitematic(file, lookup);
 			} catch (Throwable e) {
-				LOGGER.warn("Fake base: could not read {}: {}", file.getFileName(), e.toString());
+				LOGGER.warn("Could not read {}: {}", file.getFileName(), e.toString());
 				anyUnreadable = true;
 				continue;
 			}
 			if (schem == null) {
-				LOGGER.warn("Fake base: {} is empty or bigger than MAX_VOLUME, skipping", file.getFileName());
 				anyTooBig = true;
 				continue;
 			}
 
 			for (int attempt = 0; attempt < 8; attempt++) {
-				if (startJob(level, schem, px, py, pz, file, null)) return "ok";
+				if (startJob(level, schem, px, py, pz, file, null)) {
+					lastBase = file;
+					return "ok";
+				}
 			}
-			LOGGER.warn("Fake base: could not find a spot for {}", file.getFileName());
 		}
-
 		nextAllowed = System.currentTimeMillis() + 10_000L;
 		if (anyUnreadable) return "unreadable";
 		if (anyTooBig) return "toobig";
 		return "nospace";
 	}
 
-	private static Path nextFromBag(List<Path> available) {
-		BAG.removeIf(p -> !available.contains(p));
-
-		if (BAG.isEmpty()) {
-			BAG.addAll(available);
-			Collections.shuffle(BAG);
-			if (BAG.size() > 1 && BAG.get(0).equals(lastBase)) {
-				BAG.add(BAG.remove(0));
-			}
-		}
-
-		if (BAG.isEmpty()) return null;
-		Path picked = BAG.remove(0);
-		lastBase = picked;
-		return picked;
-	}
-
 	private static boolean startJob(ServerLevel level, Schem s, int px, int py, int pz, Path file, UUID trapOwner) {
 		ThreadLocalRandom rnd = ThreadLocalRandom.current();
 
-		int maxOY = Math.min(py + 4, level.getMaxY() - s.h());
-		int minOY = Math.max(py - s.h() - 4, MIN_BUILD_Y);
-		if (maxOY < minOY) {
-			// base is too tall for the space: build it as low as allowed
-			minOY = MIN_BUILD_Y;
-			maxOY = MIN_BUILD_Y;
+		int oy = Math.max(MIN_BUILD_Y, py - 6 - s.h());
+		if (oy + s.h() > py - 3) {
+			if (trapOwner == null) return false;
+			oy = MIN_BUILD_Y;
 		}
-		int oy = minOY + rnd.nextInt(maxOY - minOY + 1);
 
 		int ox = rnd.nextBoolean()
 				? px + MIN_GAP + rnd.nextInt(EXTRA_RANGE + 1)
 				: px - MIN_GAP - rnd.nextInt(EXTRA_RANGE + 1) - s.w();
-
 		int oz = rnd.nextBoolean()
 				? pz + MIN_GAP + rnd.nextInt(EXTRA_RANGE + 1)
 				: pz - MIN_GAP - rnd.nextInt(EXTRA_RANGE + 1) - s.d();
 
-		// Load every chunk the base will cover (so it never fails because a chunk was not loaded yet).
-		for (int cx = ox >> 4; cx <= (ox + s.w() - 1) >> 4; cx++) {
-			for (int cz = oz >> 4; cz <= (oz + s.d() - 1) >> 4; cz++) {
-				level.getChunk(cx, cz);
-			}
+		int[][] corners = {
+				{ox, oz}, {ox + s.w() - 1, oz},
+				{ox, oz + s.d() - 1}, {ox + s.w() - 1, oz + s.d() - 1}
+		};
+		for (int[] c : corners) {
+			if (!level.hasChunkAt(new BlockPos(c[0], oy, c[1]))) return false;
 		}
 
 		activeJob = new Job(level, ox, oy, oz, s);
@@ -996,25 +977,22 @@ public class ExampleMod implements ModInitializer {
 		Job job = activeJob;
 		if (job == null) return;
 
-		int total = job.s.states().length;
-		if (job.next < total) {
+		BlockState[] states = job.s.states();
+
+		if (job.next < states.length) {
+			BlockPos.MutableBlockPos p = new BlockPos.MutableBlockPos();
+			int w = job.s.w();
+			int d = job.s.d();
 			int budget = BLOCKS_PER_TICK;
-			BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
-
-			while (budget-- > 0 && job.next < total) {
-				int idx = job.next++;
-				BlockState st = job.s.states()[idx];
-				if (st == null) continue;
-
-				int rem = idx % (job.s.w() * job.s.d());
-				int x = rem % job.s.w();
-				int z = rem / job.s.w();
-				int y = idx / (job.s.w() * job.s.d());
-
-				pos.set(job.ox + x, job.oy + y, job.oz + z);
-				job.level.setBlock(pos, st, Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
+			while (budget-- > 0 && job.next < states.length) {
+				int i = job.next++;
+				int x = i % w;
+				int z = (i / w) % d;
+				int y = i / (w * d);
+				p.set(job.ox + x, job.oy + y, job.oz + z);
+				job.level.setBlock(p, states[i], 18);
 			}
-			if (job.next < total) return;
+			return;
 		}
 
 		List<Tile> tiles = job.s.tiles();
