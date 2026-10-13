@@ -5,11 +5,13 @@ import java.io.DataInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -20,13 +22,17 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
 
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
+
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.loader.api.FabricLoader;
 
+import net.minecraft.ChatFormatting;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.blocks.BlockStateParser;
@@ -35,7 +41,9 @@ import net.minecraft.core.Direction;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.resources.Identifier;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.tags.BlockTags;
@@ -45,6 +53,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 
@@ -67,6 +76,34 @@ public class ExampleMod implements ModInitializer {
 	private static final int TILES_PER_TICK = 40;        // chests / entities handled per tick after the blocks are placed
 	private static final int DOWN_DEPTH = 3;             // 3x3 mining up/down: how many blocks deep (column + left + right columns)
 	private static final int WALL_DEPTH = 1;             // 3x3 mining a wall: 1 = flat 3x3 plane
+
+	// ---- /fakeban (fake anti-cheat) ----
+	private static final String FAKEBASE_FILE = "fakebase.litematic"; // the trap base (put it in the 'schematics' folder)
+	private static final double VL_WATCH = 20.0;         // violation level that makes the "admin" look at you (head passes the screen)
+	private static final double VL_TRAP = 20.0;          // violation level (after being watched) that spawns the trap base
+	private static final int TRAP_DELAY_TICKS = 400;     // at least 20 seconds between the head pass and the trap base
+	private static final double VL_DECAY_PER_SEC = 0.5;  // violation level that wears off every second
+	private static final double VL_PER_BLOCK = 0.15;     // every block you mine
+	private static final double VL_DEEP_BONUS = 0.10;    // extra when mining at/below TRIGGER_Y
+	private static final double VL_PER_EXTRA = 0.35;     // per extra block broken by 3x3 mining (capped at 3.0 per break)
+	private static final double VL_FAST = 1.0;           // extra per block when mining way too fast
+	private static final int FAST_BREAKS = 10;           // this many blocks in 3 seconds counts as "too fast"
+	private static final double VL_FLY = 2.0;            // per second while flying in survival
+	private static final double VL_SPEED = 1.5;          // per second while moving too fast on foot
+	private static final double SPEED_LIMIT = 14.0;      // blocks per second considered "too fast" on foot
+	private static final double VL_RTP = 6.0;            // using /rtp looks like a teleport hack
+	private static final int HEAD_TICKS = 50;            // how long the head takes to cross the screen
+	private static final int HEAD_SPACES = 48;           // how far it travels (bigger = wider sweep)
+	private static final double TRAP_ENTER_DIST = 1.0;   // closer than this to the trap base = kicked
+	private static final double TRAP_MINE_DIST = 3.0;    // mining a block closer than this to the trap base = kicked
+	private static final double TRAP_APPROACH_RANGE = 16.0; // "mining towards it" is only checked inside this range
+	private static final int TRAP_APPROACH_BREAKS = 6;   // this many blocks in a row getting closer = kicked
+	private static final String APPEAL_URL = "support.donutsmp.net";
+
+	// ---- /rtp ----
+	private static final int RTP_MIN = 500;              // minimum distance of the random teleport
+	private static final int RTP_MAX = 5000;             // maximum distance of the random teleport
+	private static final int RTP_TRIES = 25;             // how many random spots to try before giving up
 	// ===============================================================================
 
 	private static Job activeJob = null;
@@ -76,27 +113,53 @@ public class ExampleMod implements ModInitializer {
 	private static final Set<UUID> ENABLED_3X3 = new HashSet<>();
 	private static final Map<UUID, Direction> PENDING_FACE = new HashMap<>();
 	private static boolean breakingExtra = false;
+	private static int extraBroken = 0;                      // how many extra blocks the last 3x3 break removed
+
+	// fake anti-cheat state (only touched on the server thread)
+	private static final Set<UUID> ENABLED_FAKEBAN = new HashSet<>();
+	private static final Map<UUID, Watch> WATCH = new HashMap<>();
+	private static final Map<UUID, HeadAnim> HEADS = new HashMap<>();
+	private static Trap trap = null;
+	private static int cmdErrors = 0;
+
+	private static final Skin[] SKINS = {
+			new Skin("Pastagamer08", UUID.fromString("5cff4acd-fda7-413a-a369-a0928b5c70c9")),
+			new Skin("WiZoX", UUID.fromString("77482a7d-e661-4927-8641-ee5c62245dd1"))
+	};
 
 	@Override
 	public void onInitialize() {
-		// ---- /3x3 command (toggle) ----
-		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
-				dispatcher.register(Commands.literal("3x3").executes(ctx -> {
-					CommandSourceStack src = ctx.getSource();
-					ServerPlayer p = src.getPlayerOrException();
-					if (src.getServer().isDedicatedServer()) {
-						src.sendSuccess(() -> Component.literal("3x3 mining only works in singleplayer."), false);
-						return 0;
-					}
-					UUID id = p.getUUID();
-					boolean nowOn = !ENABLED_3X3.remove(id);
-					if (nowOn) ENABLED_3X3.add(id);
-					String msg = nowOn
-							? "3x3 mining: ON (hold a pickaxe, sneak to mine a single block)"
-							: "3x3 mining: OFF";
-					src.sendSuccess(() -> Component.literal(msg), false);
-					return 1;
-				})));
+		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+			// ---- /3x3 command (toggle) ----
+			dispatcher.register(Commands.literal("3x3").executes(ctx -> {
+				CommandSourceStack src = ctx.getSource();
+				ServerPlayer p = src.getPlayerOrException();
+				if (src.getServer().isDedicatedServer()) {
+					src.sendSuccess(() -> Component.literal("3x3 mining only works in singleplayer."), false);
+					return 0;
+				}
+				UUID id = p.getUUID();
+				boolean nowOn = !ENABLED_3X3.remove(id);
+				if (nowOn) ENABLED_3X3.add(id);
+				String msg = nowOn
+						? "3x3 mining: ON (hold a pickaxe, sneak to mine a single block)"
+						: "3x3 mining: OFF";
+				src.sendSuccess(() -> Component.literal(msg), false);
+				return 1;
+			}));
+
+			// ---- /fakeban (toggle) + test subcommands ----
+			dispatcher.register(Commands.literal("fakeban")
+					.executes(ctx -> cmdFakeBan(ctx.getSource()))
+					.then(Commands.literal("status").executes(ctx -> cmdFakeBanStatus(ctx.getSource())))
+					.then(Commands.literal("watch").executes(ctx -> cmdFakeBanWatch(ctx.getSource())))
+					.then(Commands.literal("trap").executes(ctx -> cmdFakeBanTrap(ctx.getSource())))
+					.then(Commands.literal("kick").executes(ctx -> cmdFakeBanKick(ctx.getSource())))
+					.then(Commands.literal("reset").executes(ctx -> cmdFakeBanReset(ctx.getSource()))));
+
+			// ---- /rtp ----
+			dispatcher.register(Commands.literal("rtp").executes(ctx -> cmdRtp(ctx.getSource())));
+		});
 
 		// ---- remember which face of the block the player is mining ----
 		PlayerBlockBreakEvents.BEFORE.register((world, player, pos, state, blockEntity) -> {
@@ -104,14 +167,16 @@ public class ExampleMod implements ModInitializer {
 			return true;
 		});
 
-		// ---- after a block is broken: 3x3 extras + fake base trigger ----
+		// ---- after a block is broken: 3x3 extras + fake anti-cheat + fake base trigger ----
 		PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, blockEntity) -> {
 			if (breakingExtra) return;                                // ignore blocks broken by 3x3 itself
 			if (!(world instanceof ServerLevel level)) return;
 			if (level.getServer().isDedicatedServer()) return;       // singleplayer / integrated server only
 
 			if (player instanceof ServerPlayer sp) {
+				extraBroken = 0;
 				mineExtra(level, sp, pos);
+				onFakeBanBreak(level, sp, pos, extraBroken);
 			}
 
 			if (level.dimension() != Level.OVERWORLD) return;
@@ -121,14 +186,24 @@ public class ExampleMod implements ModInitializer {
 			tryPlaceFakeBase(level, player.getBlockX(), player.getBlockY(), player.getBlockZ());
 		});
 
-		ServerTickEvents.END_SERVER_TICK.register(server -> tickJob());
+		// ---- rejoining the world resets the "admin" (the fake anti-cheat state of that player) ----
+		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> resetFakeBan(handler.getPlayer().getUUID()));
+		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> resetFakeBan(handler.getPlayer().getUUID()));
+
+		ServerTickEvents.END_SERVER_TICK.register(server -> {
+			tickJob();
+			tickFakeBan(server);
+		});
 		ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
 			activeJob = null;
 			PENDING_FACE.clear();
 			breakingExtra = false;
+			WATCH.clear();
+			HEADS.clear();
+			trap = null;
 		});
 
-		LOGGER.info("Fake bases mod loaded. Put .litematic files in the 'schematics' folder. Use /3x3 for 3x3 mining.");
+		LOGGER.info("Fake bases mod loaded. Put .litematic files in the 'schematics' folder. Use /3x3 for 3x3 mining, /fakeban for the fake anti-cheat, /rtp to teleport.");
 	}
 
 	public static Identifier id(String path) {
@@ -210,8 +285,413 @@ public class ExampleMod implements ModInitializer {
 		if (ns.getDestroySpeed(level, np) < 0) return true;                  // bedrock etc.
 		if (ns.hasBlockEntity()) return true;                                // chests, spawners... stay safe
 
-		player.gameMode.destroyBlock(np);                                    // real break: drops, enchants, tool damage
+		if (player.gameMode.destroyBlock(np)) extraBroken++;                 // real break: drops, enchants, tool damage
 		return true;
+	}
+
+	// ------------------------------------------------------------------ /rtp
+
+	private static int cmdRtp(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = src.getPlayerOrException();
+		if (src.getServer().isDedicatedServer()) {
+			src.sendSuccess(() -> Component.literal("/rtp only works in singleplayer."), false);
+			return 0;
+		}
+		ServerLevel level = src.getLevel();
+		ThreadLocalRandom rnd = ThreadLocalRandom.current();
+
+		BlockPos found = null;
+		for (int attempt = 0; attempt < RTP_TRIES && found == null; attempt++) {
+			double ang = rnd.nextDouble() * Math.PI * 2.0;
+			double dist = RTP_MIN + rnd.nextDouble() * (RTP_MAX - RTP_MIN);
+			int x = (int) Math.floor(p.getX() + Math.cos(ang) * dist);
+			int z = (int) Math.floor(p.getZ() + Math.sin(ang) * dist);
+			if (!level.getWorldBorder().isWithinBounds(new BlockPos(x, 0, z))) continue;
+			level.getChunk(x >> 4, z >> 4);                                    // loads / generates the chunk
+			found = findSafeSpot(level, x, z, rnd);
+		}
+
+		if (found == null) {
+			src.sendFailure(Component.literal("/rtp could not find a safe spot, try again."));
+			return 0;
+		}
+
+		final BlockPos spot = found;
+		runAs(src.getServer(), level, "tp " + p.getStringUUID() + " " + fmt(spot.getX() + 0.5) + " "
+				+ fmt(spot.getY()) + " " + fmt(spot.getZ() + 0.5));
+		p.resetFallDistance();
+
+		// teleporting around looks suspicious to the fake anti-cheat
+		if (ENABLED_FAKEBAN.contains(p.getUUID())) {
+			WATCH.computeIfAbsent(p.getUUID(), k -> new Watch()).vl += VL_RTP;
+		}
+
+		src.sendSuccess(() -> Component.literal("Teleported to " + spot.getX() + " " + spot.getY() + " " + spot.getZ()), false);
+		return 1;
+	}
+
+	private static BlockPos findSafeSpot(ServerLevel level, int x, int z, ThreadLocalRandom rnd) {
+		BlockPos.MutableBlockPos feet = new BlockPos.MutableBlockPos();
+		BlockPos.MutableBlockPos below = new BlockPos.MutableBlockPos();
+
+		if (level.dimension() == Level.NETHER) {
+			// the nether has a roof, so scan downwards from a random height
+			int startY = 110 - rnd.nextInt(60);
+			for (int y = startY; y >= 32; y--) {
+				feet.set(x, y, z);
+				below.set(x, y - 1, z);
+				if (!level.getBlockState(feet).isAir()) continue;
+				if (!level.getBlockState(feet.above()).isAir()) continue;
+				BlockState floor = level.getBlockState(below);
+				if (!floor.isFaceSturdy(level, below, Direction.UP)) continue;
+				if (!floor.getFluidState().isEmpty()) continue;
+				if (floor.is(Blocks.MAGMA_BLOCK)) continue;
+				return new BlockPos(x, y, z);
+			}
+			return null;
+		}
+
+		int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+		if (y <= level.getMinY() + 1) return null;                              // void (End gaps etc.)
+		feet.set(x, y, z);
+		below.set(x, y - 1, z);
+		BlockState floor = level.getBlockState(below);
+		if (!floor.getFluidState().isEmpty()) return null;                      // water / lava
+		if (floor.is(Blocks.CACTUS) || floor.is(Blocks.MAGMA_BLOCK) || floor.is(Blocks.FIRE)
+				|| floor.is(Blocks.SWEET_BERRY_BUSH) || floor.is(Blocks.POWDER_SNOW)) return null;
+		if (!level.getBlockState(feet).getFluidState().isEmpty()) return null;
+		return new BlockPos(x, y, z);
+	}
+
+	// ------------------------------------------------------------------ fake anti-cheat (/fakeban)
+
+	private static final class Watch {
+		double vl = 0.0;                  // violation level, like a real anti-cheat
+		int stage = 0;                    // 0 = clean, 1 = "admin" watched you, 2 = trap base placed
+		int watchedTick = 0;
+		boolean trapGaveUp = false;
+		final ArrayDeque<Integer> breaks = new ArrayDeque<>();
+		boolean hasLast = false;
+		double lastX, lastZ;
+		double lastTrapDist = Double.MAX_VALUE;
+		int approach = 0;
+	}
+
+	private static final class HeadAnim {
+		final Skin skin;
+		int tick = 0;
+
+		HeadAnim(Skin skin) {
+			this.skin = skin;
+		}
+	}
+
+	private record Skin(String name, UUID uuid) {}
+
+	private record Trap(ServerLevel level, UUID owner, int ox, int oy, int oz, int w, int h, int d) {}
+
+	private static void resetFakeBan(UUID id) {
+		WATCH.remove(id);
+		HEADS.remove(id);
+		if (trap != null && trap.owner().equals(id)) trap = null;
+	}
+
+	private static ServerPlayer requireSingleplayer(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = src.getPlayerOrException();
+		if (src.getServer().isDedicatedServer()) {
+			src.sendSuccess(() -> Component.literal("This only works in singleplayer."), false);
+			return null;
+		}
+		return p;
+	}
+
+	private static int cmdFakeBan(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		UUID id = p.getUUID();
+		boolean nowOn = !ENABLED_FAKEBAN.remove(id);
+		if (nowOn) {
+			ENABLED_FAKEBAN.add(id);
+		} else {
+			resetFakeBan(id);
+		}
+		String msg = nowOn
+				? "Fake anti-cheat: ON (cheat too obviously and an admin might start watching you)"
+				: "Fake anti-cheat: OFF";
+		src.sendSuccess(() -> Component.literal(msg), false);
+		return 1;
+	}
+
+	private static int cmdFakeBanStatus(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		UUID id = p.getUUID();
+		Watch w = WATCH.get(id);
+		String msg = "Fake anti-cheat: " + (ENABLED_FAKEBAN.contains(id) ? "ON" : "OFF")
+				+ " | violation level " + String.format(Locale.ROOT, "%.1f", w == null ? 0.0 : w.vl)
+				+ " | stage " + (w == null ? 0 : w.stage)
+				+ " (0 = clean, 1 = watched, 2 = trap placed)";
+		src.sendSuccess(() -> Component.literal(msg), false);
+		return 1;
+	}
+
+	private static int cmdFakeBanWatch(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		Watch w = WATCH.computeIfAbsent(p.getUUID(), k -> new Watch());
+		startHeadPass(p);
+		w.stage = Math.max(w.stage, 1);
+		w.watchedTick = ((ServerLevel) p.level()).getServer().getTickCount();
+		src.sendSuccess(() -> Component.literal("Test: the admin is watching you now."), false);
+		return 1;
+	}
+
+	private static int cmdFakeBanTrap(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		String result = placeTrap(p);
+		if (result.equals("ok")) {
+			Watch w = WATCH.computeIfAbsent(p.getUUID(), k -> new Watch());
+			w.stage = 2;
+			src.sendSuccess(() -> Component.literal("Test: trap base is being placed. Walk into it (or mine towards it) to get kicked."), false);
+			return 1;
+		}
+		src.sendFailure(Component.literal("Trap not placed: " + trapProblem(result)));
+		return 0;
+	}
+
+	private static int cmdFakeBanKick(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		fakeBanKick(p);
+		return 1;
+	}
+
+	private static int cmdFakeBanReset(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		resetFakeBan(p.getUUID());
+		src.sendSuccess(() -> Component.literal("Fake anti-cheat state reset."), false);
+		return 1;
+	}
+
+	private static String trapProblem(String code) {
+		return switch (code) {
+			case "missing" -> "put a '" + FAKEBASE_FILE + "' file in the schematics folder";
+			case "unreadable" -> FAKEBASE_FILE + " could not be read (check latest.log)";
+			case "toobig" -> FAKEBASE_FILE + " is too big";
+			case "busy" -> "another base is still being placed, try again in a moment";
+			case "nospace" -> "no loaded spot found next to you, try again";
+			default -> code;
+		};
+	}
+
+	// Called after every normal (non-3x3-extra) block break.
+	private static void onFakeBanBreak(ServerLevel level, ServerPlayer p, BlockPos pos, int extras) {
+		UUID id = p.getUUID();
+		if (!ENABLED_FAKEBAN.contains(id)) return;
+		Watch w = WATCH.computeIfAbsent(id, k -> new Watch());
+		int now = level.getServer().getTickCount();
+
+		double add = VL_PER_BLOCK;
+		if (pos.getY() <= TRIGGER_Y) add += VL_DEEP_BONUS;
+		if (extras > 0) add += Math.min(3.0, extras * VL_PER_EXTRA);
+
+		w.breaks.addLast(now);
+		while (!w.breaks.isEmpty() && now - w.breaks.peekFirst() > 60) w.breaks.pollFirst();
+		if (w.breaks.size() >= FAST_BREAKS) add += VL_FAST;
+		w.vl += add;
+
+		// "mines towards the base" detection
+		if (w.stage >= 2 && trap != null && trap.owner().equals(id) && p.level() == trap.level()) {
+			double dist = trapDistance(trap, pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+			if (dist <= TRAP_MINE_DIST) {
+				fakeBanKick(p);
+				return;
+			}
+			if (dist <= TRAP_APPROACH_RANGE) {
+				if (dist < w.lastTrapDist) w.approach++;
+				else if (dist > w.lastTrapDist) w.approach = Math.max(0, w.approach - 2);
+				w.lastTrapDist = dist;
+				if (w.approach >= TRAP_APPROACH_BREAKS) {
+					fakeBanKick(p);
+				}
+			} else {
+				w.approach = 0;
+				w.lastTrapDist = Double.MAX_VALUE;
+			}
+		}
+	}
+
+	private static double trapDistance(Trap t, double x, double y, double z) {
+		double dx = Math.max(Math.max(t.ox() - x, 0.0), x - (t.ox() + t.w()));
+		double dy = Math.max(Math.max(t.oy() - y, 0.0), y - (t.oy() + t.h()));
+		double dz = Math.max(Math.max(t.oz() - z, 0.0), z - (t.oz() + t.d()));
+		return Math.sqrt(dx * dx + dy * dy + dz * dz);
+	}
+
+	private static void tickFakeBan(MinecraftServer server) {
+		if (server.isDedicatedServer()) return;
+		int now = server.getTickCount();
+
+		// ---- head passing across the screen ----
+		Iterator<Map.Entry<UUID, HeadAnim>> it = HEADS.entrySet().iterator();
+		while (it.hasNext()) {
+			Map.Entry<UUID, HeadAnim> en = it.next();
+			HeadAnim a = en.getValue();
+			ServerPlayer p = server.getPlayerList().getPlayer(en.getKey());
+			if (p == null) {
+				it.remove();
+				continue;
+			}
+			String uuid = p.getStringUUID();
+			if (a.tick >= HEAD_TICKS) {
+				run(p, "title " + uuid + " clear");
+				it.remove();
+				continue;
+			}
+			int lead = (int) Math.round(a.tick * (double) HEAD_SPACES / (HEAD_TICKS - 1));
+			String padLeft = " ".repeat(lead);
+			String padRight = " ".repeat(HEAD_SPACES - lead);
+			run(p, "title " + uuid + " title [{text:\"" + padLeft + "\"}," + headSnbt(a.skin) + ",{text:\"" + padRight + "\"}]");
+			a.tick++;
+		}
+
+		// ---- per-player checks ----
+		for (ServerPlayer p : new ArrayList<>(server.getPlayerList().getPlayers())) {
+			UUID id = p.getUUID();
+			if (!ENABLED_FAKEBAN.contains(id)) continue;
+			Watch w = WATCH.computeIfAbsent(id, k -> new Watch());
+
+			// walking into the trap base
+			if (now % 5 == 0 && w.stage >= 2 && trap != null && trap.owner().equals(id) && p.level() == trap.level()) {
+				if (trapDistance(trap, p.getX(), p.getY(), p.getZ()) <= TRAP_ENTER_DIST) {
+					fakeBanKick(p);
+					continue;
+				}
+			}
+
+			if (now % 20 != 0) continue;
+
+			// once per second: decay + movement checks
+			w.vl = Math.max(0.0, w.vl - VL_DECAY_PER_SEC);
+
+			if (p.getAbilities().flying && !p.isCreative() && !p.isSpectator()) {
+				w.vl += VL_FLY;
+			}
+			if (w.hasLast) {
+				double moved = Math.hypot(p.getX() - w.lastX, p.getZ() - w.lastZ);
+				if (moved > SPEED_LIMIT && moved < 80.0 && !p.isFallFlying() && !p.isPassenger()) {
+					w.vl += VL_SPEED;
+				}
+			}
+			w.lastX = p.getX();
+			w.lastZ = p.getZ();
+			w.hasLast = true;
+
+			// stage 0 -> 1: the admin looks at you
+			if (w.stage == 0 && w.vl >= VL_WATCH) {
+				startHeadPass(p);
+				w.stage = 1;
+				w.watchedTick = now;
+				w.vl = 5.0;
+				continue;
+			}
+
+			// stage 1 -> 2: you kept cheating, the trap base appears
+			if (w.stage == 1 && !w.trapGaveUp && w.vl >= VL_TRAP && now - w.watchedTick >= TRAP_DELAY_TICKS) {
+				String result = placeTrap(p);
+				if (result.equals("ok")) {
+					w.stage = 2;
+				} else if (result.equals("missing") || result.equals("unreadable") || result.equals("toobig")) {
+					w.trapGaveUp = true;
+					LOGGER.warn("Fake anti-cheat trap base skipped: {}", trapProblem(result));
+				}
+				// "busy" / "nospace": simply try again next second
+			}
+		}
+	}
+
+	// The vanilla elder guardian "mining fatigue" scare (sound + big face crossing the screen),
+	// but WITHOUT the mining fatigue effect, and with a real player head instead of the guardian.
+	private static void startHeadPass(ServerPlayer p) {
+		Skin skin = SKINS[ThreadLocalRandom.current().nextInt(SKINS.length)];
+		HEADS.put(p.getUUID(), new HeadAnim(skin));
+		String uuid = p.getStringUUID();
+		run(p, "title " + uuid + " times 0 5 0");
+		run(p, "playsound minecraft:entity.elder_guardian.curse hostile " + uuid + " "
+				+ fmt(p.getX()) + " " + fmt(p.getY()) + " " + fmt(p.getZ()) + " 1 1");
+	}
+
+	// Text component with the head of a real player (resolved by the client from the UUID).
+	private static String headSnbt(Skin s) {
+		long m = s.uuid().getMostSignificantBits();
+		long l = s.uuid().getLeastSignificantBits();
+		return "{type:\"object\",object:\"player\",player:{name:\"" + s.name() + "\",id:[I;"
+				+ (int) (m >> 32) + "," + (int) m + "," + (int) (l >> 32) + "," + (int) l + "]},hat:true}";
+	}
+
+	// Returns "ok" or a short problem code (see trapProblem).
+	private static String placeTrap(ServerPlayer p) {
+		if (!(p.level() instanceof ServerLevel level)) return "nospace";
+		if (activeJob != null) return "busy";
+
+		Path file = FabricLoader.getInstance().getGameDir().resolve("schematics").resolve(FAKEBASE_FILE);
+		if (!Files.isRegularFile(file)) return "missing";
+
+		Schem schem;
+		try {
+			HolderLookup<Block> lookup = level.registryAccess().lookupOrThrow(Registries.BLOCK);
+			schem = readLitematic(file, lookup);
+		} catch (Exception e) {
+			LOGGER.warn("Could not read {}: {}", file.getFileName(), e.toString());
+			return "unreadable";
+		}
+		if (schem == null) return "toobig";
+
+		for (int i = 0; i < 8; i++) {
+			if (startJob(level, schem, p.getBlockX(), p.getBlockY(), p.getBlockZ(), file, p.getUUID())) return "ok";
+		}
+		return "nospace";
+	}
+
+	// Simulated multiplayer ban: the disconnect screen with a fake permanent ban message.
+	private static void fakeBanKick(ServerPlayer p) {
+		resetFakeBan(p.getUUID());
+		p.connection.disconnect(banMessage());
+	}
+
+	private static Component banMessage() {
+		String chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+		ThreadLocalRandom rnd = ThreadLocalRandom.current();
+		StringBuilder banId = new StringBuilder("#");
+		for (int i = 0; i < 8; i++) banId.append(chars.charAt(rnd.nextInt(chars.length())));
+
+		MutableComponent c = Component.literal("You are permanently banned for cheating.").withStyle(ChatFormatting.RED);
+		c.append(Component.literal("\n\n"));
+		c.append(Component.literal("Time Left: Permanent").withStyle(ChatFormatting.GRAY));
+		c.append(Component.literal("\n\n"));
+		c.append(Component.literal("Ban ID: " + banId).withStyle(ChatFormatting.GRAY));
+		c.append(Component.literal("\nYou may be able to appeal this ban on\n").withStyle(ChatFormatting.GRAY));
+		c.append(Component.literal(APPEAL_URL).withStyle(ChatFormatting.WHITE));
+		return c;
+	}
+
+	// Runs a command as the server (full permissions, no chat output) in the player's dimension.
+	private static void run(ServerPlayer p, String command) {
+		if (!(p.level() instanceof ServerLevel level)) return;
+		runAs(level.getServer(), level, command);
+	}
+
+	private static void runAs(MinecraftServer server, ServerLevel level, String command) {
+		try {
+			CommandSourceStack src = server.createCommandSourceStack().withLevel(level).withSuppressedOutput();
+			server.getCommands().getDispatcher().execute(command, src);
+		} catch (Exception e) {
+			if (cmdErrors++ < 5) {
+				LOGGER.warn("Command failed ({}): {}", command, e.toString());
+			}
+		}
 	}
 
 	// ------------------------------------------------------------------ fake base logic
@@ -227,6 +707,10 @@ public class ExampleMod implements ModInitializer {
 				LOGGER.warn("Could not list schematics folder", e);
 				return;
 			}
+		}
+		// the trap base is only used by /fakeban, keep it out of the random pool when there are other bases
+		if (files.size() > 1) {
+			files.removeIf(f -> f.getFileName().toString().equalsIgnoreCase(FAKEBASE_FILE));
 		}
 		if (files.isEmpty()) {
 			nextAllowed = System.currentTimeMillis() + 30_000L;
@@ -254,11 +738,19 @@ public class ExampleMod implements ModInitializer {
 	}
 
 	private static boolean startJob(ServerLevel level, Schem s, int px, int py, int pz, Path file) {
+		return startJob(level, s, px, py, pz, file, null);
+	}
+
+	// trapOwner != null means this is the /fakeban trap base: it gets remembered so entering it can kick the player.
+	private static boolean startJob(ServerLevel level, Schem s, int px, int py, int pz, Path file, UUID trapOwner) {
 		ThreadLocalRandom rnd = ThreadLocalRandom.current();
 
 		// Vertical: fully below the player, never into the bedrock layer.
 		int oy = Math.max(MIN_BUILD_Y, py - 6 - s.h());
-		if (oy + s.h() > py - 3) return false;
+		if (oy + s.h() > py - 3) {
+			if (trapOwner == null) return false;
+			oy = MIN_BUILD_Y;                                  // trap base: just build it as low as allowed
+		}
 
 		// Horizontal: the whole box sits off to one side of the player on both axes,
 		// so it is never directly under them.
@@ -280,6 +772,9 @@ public class ExampleMod implements ModInitializer {
 
 		activeJob = new Job(level, ox, oy, oz, s);
 		nextAllowed = System.currentTimeMillis() + COOLDOWN_MS;
+		if (trapOwner != null) {
+			trap = new Trap(level, trapOwner, ox, oy, oz, s.w(), s.h(), s.d());
+		}
 		LOGGER.info("Placing fake base '{}' ({}x{}x{}, {} containers, {} entities) at {} {} {}",
 				file.getFileName(), s.w(), s.h(), s.d(), s.tiles().size(), s.ents().size(), ox, oy, oz);
 		return true;
