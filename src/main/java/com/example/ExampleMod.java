@@ -79,7 +79,8 @@ public class ExampleMod implements ModInitializer {
 	// ===============================================================================
 	// CONFIGURATION - change these numbers if you want
 	// ===============================================================================
-	private static final int TRIGGER_Y = -40;            // spawn when mining at or below this Y (deepslate blocks trigger at ANY Y)
+	private static final int TRIGGER_Y = -40;            // only used by the fake anti-cheat's deep mining bonus (unchanged)
+	private static final int BASE_TRIGGER_Y = -10;       // random fake bases can spawn when mining BELOW this Y
 	private static final double CHANCE = 0.05;           // 5% chance per block mined (0.05 = 1 in 20)
 	private static final long COOLDOWN_MS = 60_000L;     // wait at least 1 minute between fake bases
 	private static final int MIN_GAP = 12;               // at least this many blocks away from the player
@@ -216,9 +217,8 @@ public class ExampleMod implements ModInitializer {
 			// ---------------- Random fake base trigger ----------------
 			if (level.dimension() != Level.OVERWORLD) return;
 
-			// Deepslate (any kind, ores included) ALWAYS counts, anything else must be at/below TRIGGER_Y.
-			boolean deepslate = isDeepslate(state);
-			if (!deepslate && pos.getY() > TRIGGER_Y) return;
+			// Any block mined below BASE_TRIGGER_Y (Y -10) counts, no matter what block it is.
+			if (pos.getY() >= BASE_TRIGGER_Y) return;
 
 			if (ThreadLocalRandom.current().nextDouble() >= CHANCE) return;
 
