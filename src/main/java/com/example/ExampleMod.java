@@ -81,8 +81,8 @@ public class ExampleMod implements ModInitializer {
 	// ===============================================================================
 	private static final int TRIGGER_Y = -40;            // only used by the fake anti-cheat's deep mining bonus (unchanged)
 	private static final int BASE_TRIGGER_Y = -10;       // random fake bases can spawn when mining BELOW this Y
-	private static final double CHANCE = 1.0;            // FIXED: 100% = a base spawns on the first block mined below Y -10 (then the cooldown applies)
-	private static final long COOLDOWN_MS = 60_000L;     // wait at least 1 minute between fake bases
+	private static final double CHANCE = 1.0;            // 100% chance per block mined (spawns when not on cooldown)
+	private static final long COOLDOWN_MS = 60_000L;     // wait at least 1 minute (60 seconds) between fake bases
 	private static final int MIN_GAP = 12;               // at least this many blocks away from the player
 	private static final int EXTRA_RANGE = 20;           // plus 0 to this many extra blocks (total 12..32)
 	private static final int MIN_BUILD_Y = -58;          // never build below this (stay above bedrock)
@@ -220,7 +220,7 @@ public class ExampleMod implements ModInitializer {
 			// Any block mined below BASE_TRIGGER_Y (Y -10) counts, no matter what block it is.
 			if (pos.getY() >= BASE_TRIGGER_Y) return;
 
-			if (ThreadLocalRandom.current().nextDouble() >= CHANCE) return;
+			if (CHANCE < 1.0 && ThreadLocalRandom.current().nextDouble() >= CHANCE) return;
 
 			if (activeJob != null) {
 				if (DEBUG_LOG) LOGGER.info("Fake base roll hit but a base is still being pasted, skipped.");
