@@ -43,8 +43,9 @@ import net.minecraft.ChatFormatting;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.client.resources.sounds.SimpleSoundInstance;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.blocks.BlockStateParser;
@@ -176,6 +177,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	public static final List<GuiCommand> REGISTERED_COMMANDS = new ArrayList<>();
 	private static KeyMapping guiKeyMapping = null;
 	private static boolean clientInitialized = false;
+	private static int keyCooldown = 0;
 
 	@Override
 	public void onInitialize() {
@@ -336,19 +338,29 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		if (clientInitialized) return;
 		clientInitialized = true;
 
+		// 1.21.11+ / 26.x requires KeyMapping.Category
+		KeyMapping.Category guiCategory = KeyMapping.Category.register(id("gui"));
+
 		guiKeyMapping = KeyBindingHelper.registerKeyBinding(new KeyMapping(
 				"key." + MOD_ID + ".gui",
 				InputConstants.Type.KEYSYM,
 				GLFW.GLFW_KEY_INSERT,
-				"category." + MOD_ID
+				guiCategory
 		));
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
-			while (guiKeyMapping.consumeClick()) {
-				if (client.screen == null) {
+			if (keyCooldown > 0) keyCooldown--;
+
+			if (client.screen == null) {
+				while (guiKeyMapping.consumeClick()) {
 					client.setScreen(new ClickGuiScreen());
-				} else if (client.screen instanceof ClickGuiScreen) {
+					keyCooldown = 8;
+				}
+			} else if (client.screen instanceof ClickGuiScreen) {
+				// Toggle close with Insert key
+				if (keyCooldown == 0 && InputConstants.isKeyDown(client.getWindow().getWindow(), GLFW.GLFW_KEY_INSERT)) {
 					client.setScreen(null);
+					keyCooldown = 8;
 				}
 			}
 		});
@@ -415,20 +427,11 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	}
 
 	// ===============================================================================
-	// ClickGUI Screen Implementation
+	// ClickGUI Screen Implementation (Vanilla Widgets for 100% Cross-Version Stability)
 	// ===============================================================================
 	public static class ClickGuiScreen extends Screen {
-		private static int winX = 60;
-		private static int winY = 40;
 		private static final int WIN_WIDTH = 250;
-		private static final int WIN_HEIGHT = 300;
-		private static final int HEADER_HEIGHT = 24;
-		private static final int ITEM_HEIGHT = 26;
-
-		private boolean dragging = false;
-		private int dragOffsetX = 0;
-		private int dragOffsetY = 0;
-		private int scrollOffset = 0;
+		private final Map<String, Button> buttons = new HashMap<>();
 
 		public ClickGuiScreen() {
 			super(Component.literal("Mod ClickGUI"));
@@ -436,200 +439,102 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 		@Override
 		public boolean isPauseScreen() {
-			return false; // keeps the game world rendering and ticking behind the GUI
+			return false; // does not pause in singleplayer
 		}
 
 		@Override
-		public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-			if (keyCode == GLFW.GLFW_KEY_INSERT || keyCode == GLFW.GLFW_KEY_ESCAPE) {
-				this.onClose();
-				return true;
+		protected void init() {
+			this.clearWidgets();
+			buttons.clear();
+
+			int panelW = WIN_WIDTH;
+			int panelH = Math.min(320, this.height - 40);
+			int panelX = (this.width - panelW) / 2;
+			int panelY = (this.height - panelH) / 2;
+
+			int btnW = panelW - 24;
+			int btnH = 20;
+			int startY = panelY + 36;
+			int spacing = 24;
+
+			for (int i = 0; i < REGISTERED_COMMANDS.size(); i++) {
+				GuiCommand cmd = REGISTERED_COMMANDS.get(i);
+				int curY = startY + (i * spacing);
+				if (curY + btnH > panelY + panelH - 28) break;
+
+				Button btn = Button.builder(getButtonMessage(cmd), b -> {
+					executeGuiCommand(cmd.command);
+					Minecraft.getInstance().tell(this::updateAllButtons);
+				})
+				.bounds(panelX + 12, curY, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal(cmd.description)))
+				.build();
+
+				this.addRenderableWidget(btn);
+				buttons.put(cmd.command, btn);
 			}
-			return super.keyPressed(keyCode, scanCode, modifiers);
+
+			// Close button at bottom
+			Button closeBtn = Button.builder(Component.literal("✕ Close [Esc]"), b -> this.onClose())
+					.bounds(panelX + 12, panelY + panelH - 22, btnW, 18)
+					.build();
+			this.addRenderableWidget(closeBtn);
+		}
+
+		private void updateAllButtons() {
+			for (GuiCommand cmd : REGISTERED_COMMANDS) {
+				Button b = buttons.get(cmd.command);
+				if (b != null) {
+					b.setMessage(getButtonMessage(cmd));
+				}
+			}
+		}
+
+		private static Component getButtonMessage(GuiCommand cmd) {
+			if (cmd.isToggle) {
+				boolean on = isCommandActive(cmd.command);
+				MutableComponent c = Component.literal("/" + cmd.command + "  ");
+				if (on) {
+					c.append(Component.literal("[ON]").withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD));
+				} else {
+					c.append(Component.literal("[OFF]").withStyle(ChatFormatting.RED, ChatFormatting.BOLD));
+				}
+				return c;
+			} else {
+				return Component.literal("/" + cmd.command + "  ")
+						.append(Component.literal("[RUN]").withStyle(ChatFormatting.AQUA, ChatFormatting.BOLD));
+			}
 		}
 
 		@Override
 		public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
-			// Dim background slightly
-			graphics.fill(0, 0, this.width, this.height, 0x55000000);
+			// Dim background
+			graphics.fill(0, 0, this.width, this.height, 0x66000000);
 
-			int x = winX;
-			int y = winY;
-			int w = WIN_WIDTH;
-			int h = WIN_HEIGHT;
+			int panelW = WIN_WIDTH;
+			int panelH = Math.min(320, this.height - 40);
+			int panelX = (this.width - panelW) / 2;
+			int panelY = (this.height - panelH) / 2;
 
-			// Window Background (Deep obsidian)
-			graphics.fill(x, y, x + w, y + h, 0xEE12151C);
-			// Outer Border
-			graphics.fill(x - 1, y - 1, x + w + 1, y, 0xFF282C3D);
-			graphics.fill(x - 1, y + h, x + w + 1, y + h + 1, 0xFF282C3D);
-			graphics.fill(x - 1, y, x, y + h, 0xFF282C3D);
-			graphics.fill(x + w, y, x + w + 1, y + h, 0xFF282C3D);
+			// Window Body
+			graphics.fill(panelX, panelY, panelX + panelW, panelY + panelH, 0xEE12151C);
 
-			// Top Accent Stripe (Neon Cyan)
-			graphics.fill(x, y, x + w, y + 2, 0xFF00E5FF);
+			// Borders
+			graphics.fill(panelX - 1, panelY - 1, panelX + panelW + 1, panelY, 0xFF282C3D);
+			graphics.fill(panelX - 1, panelY + panelH, panelX + panelW + 1, panelY + panelH + 1, 0xFF282C3D);
+			graphics.fill(panelX - 1, panelY, panelX, panelY + panelH, 0xFF282C3D);
+			graphics.fill(panelX + panelW, panelY, panelX + panelW + 1, panelY + panelH, 0xFF282C3D);
 
-			// Header Bar
-			graphics.fill(x, y + 2, x + w, y + HEADER_HEIGHT, 0xFF181C26);
-			graphics.drawString(this.font, Component.literal("⚡ COMMANDS & MODULES"), x + 10, y + 8, 0xFFFFFFFF, false);
+			// Neon Cyan Accent Stripe
+			graphics.fill(panelX, panelY, panelX + panelW, panelY + 2, 0xFF00E5FF);
 
-			// Close button [X]
-			boolean hoverClose = mouseX >= x + w - 20 && mouseX <= x + w - 4 && mouseY >= y + 4 && mouseY <= y + 20;
-			graphics.fill(x + w - 20, y + 5, x + w - 5, y + 19, hoverClose ? 0xFFFF4757 : 0x33FFFFFF);
-			graphics.drawString(this.font, Component.literal("✕"), x + w - 16, y + 8, hoverClose ? 0xFFFFFFFF : 0xFFB0B4C0, false);
+			// Header Title
+			graphics.fill(panelX, panelY + 2, panelX + panelW, panelY + 24, 0xFF181C26);
+			graphics.drawString(this.font, Component.literal("⚡ MOD CLICKGUI").withStyle(ChatFormatting.BOLD), panelX + 10, panelY + 8, 0xFFFFFFFF, false);
+			graphics.drawString(this.font, Component.literal("[Insert] Toggle"), panelX + panelW - 90, panelY + 8, 0xFF71788E, false);
 
-			// Subtitle / Info
-			graphics.fill(x, y + HEADER_HEIGHT, x + w, y + HEADER_HEIGHT + 14, 0xFF141720);
-			graphics.drawString(this.font, Component.literal("[Insert] Close | Drag header to move"), x + 8, y + HEADER_HEIGHT + 3, 0xFF71788E, false);
-
-			// Command List Area
-			int contentTop = y + HEADER_HEIGHT + 16;
-			int contentHeight = h - (HEADER_HEIGHT + 20);
-			int visibleCount = contentHeight / ITEM_HEIGHT;
-			int maxScroll = Math.max(0, REGISTERED_COMMANDS.size() - visibleCount);
-			scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
-
-			// Render items
-			GuiCommand hoveredCmd = null;
-			for (int i = 0; i < visibleCount; i++) {
-				int index = i + scrollOffset;
-				if (index >= REGISTERED_COMMANDS.size()) break;
-				GuiCommand cmd = REGISTERED_COMMANDS.get(index);
-
-				int itemY = contentTop + (i * ITEM_HEIGHT);
-				boolean hovered = mouseX >= x + 8 && mouseX <= x + w - 8 && mouseY >= itemY && mouseY < itemY + ITEM_HEIGHT - 3;
-				if (hovered) hoveredCmd = cmd;
-
-				// Row Background
-				int rowBg = hovered ? 0xFF242A38 : 0xFF191D26;
-				graphics.fill(x + 8, itemY, x + w - 8, itemY + ITEM_HEIGHT - 3, rowBg);
-
-				// Highlight border on hover
-				if (hovered) {
-					graphics.fill(x + 8, itemY, x + 9, itemY + ITEM_HEIGHT - 3, 0xFF00E5FF);
-				}
-
-				// Command Name
-				graphics.drawString(this.font, Component.literal("/" + cmd.command), x + 14, itemY + 6, 0xFFE2E6F0, false);
-
-				// State / Action Badge on the right
-				if (cmd.isToggle) {
-					boolean on = isCommandActive(cmd.command);
-					int badgeBg = on ? 0x442ECC71 : 0x44E74C3C;
-					int badgeBorder = on ? 0xFF2ECC71 : 0xFFE74C3C;
-					int badgeText = on ? 0xFF2ECC71 : 0xFFE74C3C;
-					String label = on ? "ON" : "OFF";
-
-					int badgeW = 34;
-					int badgeX = x + w - badgeW - 14;
-					graphics.fill(badgeX, itemY + 4, badgeX + badgeW, itemY + ITEM_HEIGHT - 7, badgeBg);
-					graphics.fill(badgeX, itemY + 4, badgeX + badgeW, itemY + 5, badgeBorder);
-					graphics.fill(badgeX, itemY + ITEM_HEIGHT - 8, badgeX + badgeW, itemY + ITEM_HEIGHT - 7, badgeBorder);
-					graphics.drawString(this.font, Component.literal(label), badgeX + (on ? 10 : 8), itemY + 6, badgeText, false);
-				} else {
-					int badgeW = 34;
-					int badgeX = x + w - badgeW - 14;
-					graphics.fill(badgeX, itemY + 4, badgeX + badgeW, itemY + ITEM_HEIGHT - 7, 0x4400E5FF);
-					graphics.fill(badgeX, itemY + 4, badgeX + badgeW, itemY + 5, 0xFF00E5FF);
-					graphics.fill(badgeX, itemY + ITEM_HEIGHT - 8, badgeX + badgeW, itemY + ITEM_HEIGHT - 7, 0xFF00E5FF);
-					graphics.drawString(this.font, Component.literal("RUN"), badgeX + 8, itemY + 6, 0xFF00E5FF, false);
-				}
-			}
-
-			// Scrollbar indicator
-			if (maxScroll > 0) {
-				int barTrackH = contentHeight - 6;
-				int barThumbH = Math.max(16, barTrackH * visibleCount / REGISTERED_COMMANDS.size());
-				int barThumbY = contentTop + 3 + (barTrackH - barThumbH) * scrollOffset / maxScroll;
-				graphics.fill(x + w - 6, contentTop + 3, x + w - 3, contentTop + 3 + barTrackH, 0xFF141720);
-				graphics.fill(x + w - 6, barThumbY, x + w - 3, barThumbY + barThumbH, 0xFF00E5FF);
-			}
-
-			// Hover Tooltip
-			if (hoveredCmd != null) {
-				graphics.renderTooltip(this.font, Component.literal(hoveredCmd.description), mouseX, mouseY);
-			}
-
+			// Render all widgets (buttons & their tooltips)
 			super.render(graphics, mouseX, mouseY, partialTick);
-		}
-
-		@Override
-		public boolean mouseClicked(double mouseX, double mouseY, int button) {
-			if (button == 0) {
-				int x = winX;
-				int y = winY;
-				int w = WIN_WIDTH;
-				int h = WIN_HEIGHT;
-
-				// Close button clicked
-				if (mouseX >= x + w - 20 && mouseX <= x + w - 4 && mouseY >= y + 4 && mouseY <= y + 20) {
-					playClickSound();
-					this.onClose();
-					return true;
-				}
-
-				// Header dragging
-				if (mouseX >= x && mouseX <= x + w && mouseY >= y && mouseY <= y + HEADER_HEIGHT) {
-					dragging = true;
-					dragOffsetX = (int) mouseX - winX;
-					dragOffsetY = (int) mouseY - winY;
-					return true;
-				}
-
-				// Command clicked
-				int contentTop = y + HEADER_HEIGHT + 16;
-				int contentHeight = h - (HEADER_HEIGHT + 20);
-				int visibleCount = contentHeight / ITEM_HEIGHT;
-
-				for (int i = 0; i < visibleCount; i++) {
-					int index = i + scrollOffset;
-					if (index >= REGISTERED_COMMANDS.size()) break;
-
-					int itemY = contentTop + (i * ITEM_HEIGHT);
-					if (mouseX >= x + 8 && mouseX <= x + w - 8 && mouseY >= itemY && mouseY < itemY + ITEM_HEIGHT - 3) {
-						GuiCommand cmd = REGISTERED_COMMANDS.get(index);
-						playClickSound();
-						executeGuiCommand(cmd.command);
-						return true;
-					}
-				}
-			}
-			return super.mouseClicked(mouseX, mouseY, button);
-		}
-
-		@Override
-		public boolean mouseReleased(double mouseX, double mouseY, int button) {
-			if (button == 0) {
-				dragging = false;
-			}
-			return super.mouseReleased(mouseX, mouseY, button);
-		}
-
-		@Override
-		public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
-			if (dragging) {
-				winX = (int) mouseX - dragOffsetX;
-				winY = (int) mouseY - dragOffsetY;
-				return true;
-			}
-			return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
-		}
-
-		@Override
-		public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
-			if (verticalAmount != 0) {
-				scrollOffset -= (int) Math.signum(verticalAmount);
-				int contentHeight = WIN_HEIGHT - (HEADER_HEIGHT + 20);
-				int visibleCount = contentHeight / ITEM_HEIGHT;
-				int maxScroll = Math.max(0, REGISTERED_COMMANDS.size() - visibleCount);
-				scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
-				return true;
-			}
-			return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount);
-		}
-
-		private static void playClickSound() {
-			Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, 1.0F));
 		}
 	}
 
@@ -966,7 +871,6 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		}
 	}
 
-	// Distance from a point (x, y, z) to the bounding box of a trap base.
 	private static double trapDistance(Trap t, double x, double y, double z) {
 		double dx = Math.max(Math.max(t.ox() - x, 0.0), x - (t.ox() + t.w()));
 		double dy = Math.max(Math.max(t.oy() - y, 0.0), y - (t.oy() + t.h()));
@@ -1105,12 +1009,12 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		p.playSound(SoundEvents.ELDER_GUARDIAN_CURSE, 1.0f, 1.0f);
 		run(p, "playsound minecraft:entity.elder_guardian.curse hostile @s ~ ~ ~ 1 1");
 
-		// 2. Display ominous warning subtitle
+		// 2. Display warning subtitle
 		run(p, "title @s times 0 " + HEAD_TICKS + " 10");
 		run(p, "title @s subtitle [{\"text\":\"[ \",\"color\":\"gray\"},{\"text\":\"" + skin.name() + "\",\"color\":\"red\",\"bold\":true},{\"text\":\" is watching you ]\",\"color\":\"gray\"}]");
 		run(p, "title @s title {\"text\":\"\"}");
 
-		// 3. Spawn invisible ArmorStand wearing player head
+		// 3. Spawn invisible ArmorStand
 		Vec3 eye = p.getEyePosition();
 		ArmorStand stand = new ArmorStand(level, eye.x, eye.y - 1.70, eye.z);
 
