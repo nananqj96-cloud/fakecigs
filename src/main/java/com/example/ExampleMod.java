@@ -177,7 +177,6 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	public static final List<GuiCommand> REGISTERED_COMMANDS = new ArrayList<>();
 	private static KeyMapping guiKeyMapping = null;
 	private static boolean clientInitialized = false;
-	private static int keyCooldown = 0;
 
 	@Override
 	public void onInitialize() {
@@ -349,18 +348,11 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		));
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
-			if (keyCooldown > 0) keyCooldown--;
-
-			if (client.screen == null) {
-				while (guiKeyMapping.consumeClick()) {
+			while (guiKeyMapping.consumeClick()) {
+				if (client.screen == null) {
 					client.setScreen(new ClickGuiScreen());
-					keyCooldown = 8;
-				}
-			} else if (client.screen instanceof ClickGuiScreen) {
-				// Toggle close with Insert key
-				if (keyCooldown == 0 && InputConstants.isKeyDown(client.getWindow().getWindow(), GLFW.GLFW_KEY_INSERT)) {
+				} else if (client.screen instanceof ClickGuiScreen) {
 					client.setScreen(null);
-					keyCooldown = 8;
 				}
 			}
 		});
@@ -464,7 +456,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 				Button btn = Button.builder(getButtonMessage(cmd), b -> {
 					executeGuiCommand(cmd.command);
-					Minecraft.getInstance().tell(this::updateAllButtons);
+					this.updateAllButtons();
 				})
 				.bounds(panelX + 12, curY, btnW, btnH)
 				.tooltip(Tooltip.create(Component.literal(cmd.description)))
