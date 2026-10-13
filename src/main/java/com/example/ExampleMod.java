@@ -3,6 +3,8 @@ package com.example;
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
@@ -31,7 +33,6 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
@@ -81,7 +82,6 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
-import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -320,11 +320,6 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 			trap = null;
 		});
 
-		// Ensure client setup initializes on client environments
-		if (FabricLoader.getInstance().getEnvironmentType() == EnvType.CLIENT) {
-			initClient();
-		}
-
 		LOGGER.info("Fake bases mod loaded. Press [INSERT] to open ClickGUI. Use /fakebase to test, /3x3 for 3x3 mining, /fakeban for fake anti-cheat, /rtp to teleport.");
 	}
 
@@ -337,25 +332,86 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		if (clientInitialized) return;
 		clientInitialized = true;
 
-		// 1.21.11+ / 26.x requires KeyMapping.Category
-		KeyMapping.Category guiCategory = KeyMapping.Category.register(id("gui"));
-
-		guiKeyMapping = KeyBindingHelper.registerKeyBinding(new KeyMapping(
-				"key." + MOD_ID + ".gui",
-				InputConstants.Type.KEYSYM,
-				GLFW.GLFW_KEY_INSERT,
-				guiCategory
-		));
+		try {
+			KeyMapping.Category guiCategory = getGuiCategory();
+			guiKeyMapping = registerKeyMapping(createGuiKeyMapping(guiCategory));
+		} catch (Throwable t) {
+			LOGGER.warn("Failed to register Insert keymapping: {}", t.toString());
+		}
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
-			while (guiKeyMapping.consumeClick()) {
-				if (client.screen == null) {
-					client.setScreen(new ClickGuiScreen());
-				} else if (client.screen instanceof ClickGuiScreen) {
-					client.setScreen(null);
+			if (guiKeyMapping != null) {
+				while (guiKeyMapping.consumeClick()) {
+					if (client.screen == null) {
+						client.setScreen(new ClickGuiScreen());
+					} else if (client.screen instanceof ClickGuiScreen) {
+						client.setScreen(null);
+					}
 				}
 			}
 		});
+	}
+
+	private static KeyMapping.Category getGuiCategory() {
+		try {
+			Method m = KeyMapping.Category.class.getMethod("register", Identifier.class);
+			return (KeyMapping.Category) m.invoke(null, id("gui"));
+		} catch (Throwable t1) {
+			try {
+				Constructor<KeyMapping.Category> ctor = KeyMapping.Category.class.getConstructor(Identifier.class);
+				return ctor.newInstance(id("gui"));
+			} catch (Throwable t2) {
+				return KeyMapping.Category.MISC;
+			}
+		}
+	}
+
+	private static KeyMapping createGuiKeyMapping(KeyMapping.Category category) {
+		int insertKey = InputConstants.KEY_INSERT; // 260
+
+		// Modern 26.3 constructor: KeyMapping(String, int, KeyMapping.Category)
+		try {
+			Constructor<KeyMapping> ctor = KeyMapping.class.getConstructor(String.class, int.class, KeyMapping.Category.class);
+			return ctor.newInstance("key." + MOD_ID + ".gui", insertKey, category);
+		} catch (Throwable ignored) {}
+
+		// Pre-26.3 constructor: KeyMapping(String, InputConstants.Type, int, KeyMapping.Category)
+		try {
+			InputConstants.Type kbType = null;
+			for (InputConstants.Type t : InputConstants.Type.values()) {
+				String name = t.name();
+				if (name.equals("KEYBOARD") || name.equals("KEY") || name.equals("KEYSYM")) {
+					kbType = t;
+					break;
+				}
+			}
+			if (kbType == null && InputConstants.Type.values().length > 0) {
+				kbType = InputConstants.Type.values()[0];
+			}
+			Constructor<KeyMapping> ctor = KeyMapping.class.getConstructor(String.class, InputConstants.Type.class, int.class, KeyMapping.Category.class);
+			return ctor.newInstance("key." + MOD_ID + ".gui", kbType, insertKey, category);
+		} catch (Throwable ignored) {}
+
+		return null;
+	}
+
+	private static KeyMapping registerKeyMapping(KeyMapping mapping) {
+		if (mapping == null) return null;
+		// 1. Try modern Fabric API (26.1+): KeyMappingHelper.registerKeyMapping
+		try {
+			Class<?> kmHelper = Class.forName("net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper");
+			Method m = kmHelper.getMethod("registerKeyMapping", KeyMapping.class);
+			return (KeyMapping) m.invoke(null, mapping);
+		} catch (Throwable ignored) {}
+
+		// 2. Try legacy Fabric API (<26.1): KeyBindingHelper.registerKeyBinding
+		try {
+			Class<?> kbHelper = Class.forName("net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper");
+			Method m = kbHelper.getMethod("registerKeyBinding", KeyMapping.class);
+			return (KeyMapping) m.invoke(null, mapping);
+		} catch (Throwable ignored) {}
+
+		return mapping;
 	}
 
 	private static void registerDefaultGuiCommands() {
@@ -384,8 +440,10 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 					|| cmdName.toLowerCase(Locale.ROOT).contains("toggle");
 			addGuiCommand(cmdName, formatCmdLabel(cmdName), "Executes /" + cmdName, isToggle);
 		}
-		for (CommandNode<CommandSourceStack> child : node.getChildren()) {
-			autoDiscoverNode(child, cmdName);
+		if (prefix.split(" ").length < 4) {
+			for (CommandNode<CommandSourceStack> child : node.getChildren()) {
+				autoDiscoverNode(child, cmdName);
+			}
 		}
 	}
 
@@ -1012,7 +1070,10 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 		ItemStack head = new ItemStack(Items.PLAYER_HEAD);
 		GameProfile gp = new GameProfile(skin.uuid(), skin.name());
-		head.set(DataComponents.PROFILE, ResolvableProfile.createResolved(gp));
+		ResolvableProfile profile = createProfile(gp);
+		if (profile != null) {
+			head.set(DataComponents.PROFILE, profile);
+		}
 		stand.setItemSlot(EquipmentSlot.HEAD, head);
 		stand.setInvisible(true);
 		stand.setNoBasePlate(true);
@@ -1023,6 +1084,20 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 		level.addFreshEntity(stand);
 		HEADS.put(p.getUUID(), new HeadAnim(skin, stand));
+	}
+
+	private static ResolvableProfile createProfile(GameProfile gp) {
+		try {
+			Method m = ResolvableProfile.class.getMethod("createResolved", GameProfile.class);
+			return (ResolvableProfile) m.invoke(null, gp);
+		} catch (Throwable t) {
+			try {
+				Constructor<ResolvableProfile> c = ResolvableProfile.class.getConstructor(GameProfile.class);
+				return c.newInstance(gp);
+			} catch (Throwable t2) {
+				return null;
+			}
+		}
 	}
 
 	private static String placeTrap(ServerPlayer p) {
