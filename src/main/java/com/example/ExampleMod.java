@@ -1,5 +1,6 @@
 package com.example;
 
+import java.awt.Color;
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
@@ -47,6 +48,7 @@ import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.blocks.BlockStateParser;
@@ -55,6 +57,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.core.Rotations;
 import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.particles.DustParticleOptions;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
@@ -82,6 +85,7 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
+import org.joml.Vector3f;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -159,6 +163,69 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 			new Skin("WiZoX", UUID.fromString("77482a7d-e661-4927-8641-ee5c62245dd1"))
 	};
 
+	// ===============================================================================
+	// SUS CHUNKS (FAKE) OVERLAY CONFIGURATION & STATE
+	// ===============================================================================
+	public static boolean susChunksEnabled = false;
+	public static int susColorIndex = 0;      // 0=Cyan, 1=Green, 2=Red, 3=Purple, 4=Yellow, 5=Orange, 6=White, 7=Rainbow
+	public static int susOpacityIndex = 2;    // 0=25%, 1=50%, 2=75%, 3=100%
+	public static int susCurvinessIndex = 2;  // 0=Sharp (0°), 1=Low (R=2), 2=Medium (R=4), 3=High (R=6), 4=Circular (R=8)
+	public static int susHeightIndex = 1;     // 0=2, 1=4, 2=6, 3=8 blocks
+
+	public static final String[] SUS_COLORS = {"Cyan", "Green", "Red", "Purple", "Yellow", "Orange", "White", "Rainbow"};
+	public static final float[][] SUS_COLOR_RGB = {
+			{0.0f, 0.9f, 1.0f},   // Cyan
+			{0.2f, 1.0f, 0.2f},   // Green
+			{1.0f, 0.15f, 0.15f}, // Red
+			{0.85f, 0.2f, 1.0f},  // Purple
+			{1.0f, 0.95f, 0.1f},  // Yellow
+			{1.0f, 0.55f, 0.05f}, // Orange
+			{1.0f, 1.0f, 1.0f},   // White
+			{0.0f, 0.0f, 0.0f}    // Rainbow (dynamic)
+	};
+
+	public static final String[] SUS_OPACITIES = {"25%", "50%", "75%", "100%"};
+	public static final float[] SUS_OPACITY_VALUES = {0.25f, 0.50f, 0.75f, 1.0f};
+
+	public static final String[] SUS_CURVINESS = {"Sharp (0°)", "Low (R=2)", "Medium (R=4)", "High (R=6)", "Circular (R=8)"};
+	public static final float[] SUS_CURVE_VALUES = {0.0f, 2.0f, 4.0f, 6.0f, 7.8f};
+
+	public static final int[] SUS_HEIGHTS = {2, 4, 6, 8};
+
+	public static final class SusSpot {
+		public final int chunkX;
+		public final int chunkZ;
+		public final double centerX;
+		public final double centerZ;
+
+		public SusSpot(int chunkX, int chunkZ) {
+			this.chunkX = chunkX;
+			this.chunkZ = chunkZ;
+			this.centerX = (chunkX << 4) + 8.0;
+			this.centerZ = (chunkZ << 4) + 8.0;
+		}
+	}
+
+	public static final List<SusSpot> SUS_SPOTS = new ArrayList<>();
+
+	public static void randomizeSusSpots() {
+		SUS_SPOTS.clear();
+		Minecraft client = Minecraft.getInstance();
+		int pChunkX = 0;
+		int pChunkZ = 0;
+		if (client.player != null) {
+			pChunkX = client.player.getBlockX() >> 4;
+			pChunkZ = client.player.getBlockZ() >> 4;
+		}
+		ThreadLocalRandom rnd = ThreadLocalRandom.current();
+		for (int i = 0; i < 4; i++) {
+			int dx = rnd.nextInt(-5, 6);
+			int dz = rnd.nextInt(-5, 6);
+			if (dx == 0 && dz == 0) dx = 1;
+			SUS_SPOTS.add(new SusSpot(pChunkX + dx, pChunkZ + dz));
+		}
+	}
+
 	// ------------------------------------------------------------------ ClickGUI System
 	public static final class GuiCommand {
 		public final String command;
@@ -221,6 +288,46 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 			// ---- /rtp ----
 			dispatcher.register(Commands.literal("rtp").executes(ctx -> cmdRtp(ctx.getSource())));
+
+			// ---- /suschunks : Fake Sus Chunks curved box overlay ----
+			dispatcher.register(Commands.literal("suschunks")
+					.executes(ctx -> {
+						susChunksEnabled = !susChunksEnabled;
+						if (susChunksEnabled && SUS_SPOTS.isEmpty()) {
+							randomizeSusSpots();
+						}
+						ctx.getSource().sendSuccess(
+								() -> Component.literal("Fake Sus Chunks overlay: " + (susChunksEnabled ? "§aENABLED" : "§cDISABLED")),
+								false
+						);
+						return 1;
+					})
+					.then(Commands.literal("color").executes(ctx -> {
+						susColorIndex = (susColorIndex + 1) % SUS_COLORS.length;
+						ctx.getSource().sendSuccess(() -> Component.literal("Sus Chunks Color: §e" + SUS_COLORS[susColorIndex]), false);
+						return 1;
+					}))
+					.then(Commands.literal("opacity").executes(ctx -> {
+						susOpacityIndex = (susOpacityIndex + 1) % SUS_OPACITIES.length;
+						ctx.getSource().sendSuccess(() -> Component.literal("Sus Chunks Opacity: §e" + SUS_OPACITIES[susOpacityIndex]), false);
+						return 1;
+					}))
+					.then(Commands.literal("curviness").executes(ctx -> {
+						susCurvinessIndex = (susCurvinessIndex + 1) % SUS_CURVINESS.length;
+						ctx.getSource().sendSuccess(() -> Component.literal("Sus Chunks Curviness: §e" + SUS_CURVINESS[susCurvinessIndex]), false);
+						return 1;
+					}))
+					.then(Commands.literal("height").executes(ctx -> {
+						susHeightIndex = (susHeightIndex + 1) % SUS_HEIGHTS.length;
+						ctx.getSource().sendSuccess(() -> Component.literal("Sus Chunks Height: §e" + SUS_HEIGHTS[susHeightIndex] + " Blocks"), false);
+						return 1;
+					}))
+					.then(Commands.literal("random").executes(ctx -> {
+						randomizeSusSpots();
+						ctx.getSource().sendSuccess(() -> Component.literal("Generated new random Sus Chunk locations near you."), false);
+						return 1;
+					}))
+			);
 
 			// Auto-discover all mod commands (including any command added in the future!)
 			for (CommandNode<CommandSourceStack> node : dispatcher.getRoot().getChildren()) {
@@ -349,7 +456,153 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 					}
 				}
 			}
+
+			// Render Sus Chunks (Fake) curved box overlay in client world
+			if (susChunksEnabled && client.level != null && client.player != null) {
+				tickSusChunksRender(client.level, client.player);
+			}
 		});
+	}
+
+	// ===============================================================================
+	// SUS CHUNKS (FAKE) CURVED BOX OVERLAY RENDERING
+	// ===============================================================================
+	private static void tickSusChunksRender(ClientLevel level, Player player) {
+		if (SUS_SPOTS.isEmpty()) {
+			randomizeSusSpots();
+		}
+
+		// Color calculation
+		float r, g, b;
+		if (susColorIndex == 7) { // Rainbow
+			float hue = (float) ((System.currentTimeMillis() % 4000L) / 4000.0);
+			int rgb = Color.HSBtoRGB(hue, 0.9f, 1.0f);
+			r = ((rgb >> 16) & 0xFF) / 255.0f;
+			g = ((rgb >> 8) & 0xFF) / 255.0f;
+			b = (rgb & 0xFF) / 255.0f;
+		} else {
+			r = SUS_COLOR_RGB[susColorIndex][0];
+			g = SUS_COLOR_RGB[susColorIndex][1];
+			b = SUS_COLOR_RGB[susColorIndex][2];
+		}
+
+		float opacity = SUS_OPACITY_VALUES[susOpacityIndex];
+		float curveRadius = SUS_CURVE_VALUES[susCurvinessIndex];
+		int boxH = SUS_HEIGHTS[susHeightIndex];
+		float particleScale = 0.5f + (opacity * 0.9f);
+
+		DustParticleOptions particle = new DustParticleOptions(new Vector3f(r, g, b), particleScale);
+
+		// Determine perimeter point density step based on opacity
+		int pointStep = (opacity <= 0.25f) ? 3 : (opacity <= 0.50f ? 2 : 1);
+
+		for (SusSpot spot : SUS_SPOTS) {
+			double distSq = player.distanceToSqr(spot.centerX, player.getY(), spot.centerZ);
+			if (distSq > 160.0 * 160.0) continue; // skip if farther than 160 blocks
+
+			List<double[]> points = getCurvedBoxPerimeter(spot.centerX, spot.centerZ, 16.0, 16.0, curveRadius);
+
+			for (int i = 0; i < points.size(); i += pointStep) {
+				double[] pt = points.get(i);
+				double px = pt[0];
+				double pz = pt[1];
+
+				int groundY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, (int) Math.floor(px), (int) Math.floor(pz));
+
+				// Bottom perimeter outline (ground level)
+				level.addParticle(particle, px, groundY + 0.05, pz, 0, 0, 0);
+
+				// Top perimeter outline
+				level.addParticle(particle, px, groundY + boxH, pz, 0, 0, 0);
+
+				// Vertical wall columns (spaced along perimeter)
+				if (i % (pointStep * 4) == 0) {
+					for (double vy = groundY + 0.8; vy < groundY + boxH; vy += 0.8) {
+						level.addParticle(particle, px, vy, pz, 0, 0, 0);
+					}
+				}
+			}
+		}
+	}
+
+	private static List<double[]> getCurvedBoxPerimeter(double cx, double cz, double width, double length, double radius) {
+		List<double[]> points = new ArrayList<>();
+		double hw = width / 2.0;
+		double hl = length / 2.0;
+		double r = Math.min(radius, Math.min(hw, hl) - 0.2);
+
+		if (r <= 0.2) {
+			// Sharp box corners (4 straight sides)
+			double minX = cx - hw, maxX = cx + hw;
+			double minZ = cz - hl, maxZ = cz + hl;
+			int stepsPerSide = 16;
+			for (int s = 0; s < stepsPerSide; s++) {
+				double t = s / (double) stepsPerSide;
+				points.add(new double[]{minX + (maxX - minX) * t, maxZ}); // North
+				points.add(new double[]{maxX, maxZ - (maxZ - minZ) * t}); // East
+				points.add(new double[]{maxX - (maxX - minX) * t, minZ}); // South
+				points.add(new double[]{minX, minZ + (maxZ - minZ) * t}); // West
+			}
+			return points;
+		}
+
+		double cneX = cx + hw - r, cneZ = cz + hl - r;
+		double cnwX = cx - hw + r, cnwZ = cz + hl - r;
+		double cswX = cx - hw + r, cswZ = cz - hl + r;
+		double cseX = cx + hw - r, cseZ = cz - hl + r;
+
+		int arcSteps = 6;
+		int edgeSteps = 6;
+
+		// 1. North straight edge (from NW corner to NE corner)
+		for (int s = 0; s < edgeSteps; s++) {
+			double t = s / (double) edgeSteps;
+			points.add(new double[]{cnwX + (cneX - cnwX) * t, cz + hl});
+		}
+
+		// 2. NE Arc (pi/2 down to 0)
+		for (int s = 0; s < arcSteps; s++) {
+			double angle = (Math.PI / 2.0) - (Math.PI / 2.0) * (s / (double) arcSteps);
+			points.add(new double[]{cneX + r * Math.cos(angle), cneZ + r * Math.sin(angle)});
+		}
+
+		// 3. East straight edge (from NE to SE)
+		for (int s = 0; s < edgeSteps; s++) {
+			double t = s / (double) edgeSteps;
+			points.add(new double[]{cx + hw, cneZ - (cneZ - cseZ) * t});
+		}
+
+		// 4. SE Arc (0 down to -pi/2)
+		for (int s = 0; s < arcSteps; s++) {
+			double angle = 0.0 - (Math.PI / 2.0) * (s / (double) arcSteps);
+			points.add(new double[]{cseX + r * Math.cos(angle), cseZ + r * Math.sin(angle)});
+		}
+
+		// 5. South straight edge (from SE to SW)
+		for (int s = 0; s < edgeSteps; s++) {
+			double t = s / (double) edgeSteps;
+			points.add(new double[]{cseX - (cseX - cswX) * t, cz - hl});
+		}
+
+		// 6. SW Arc (-pi/2 down to -pi)
+		for (int s = 0; s < arcSteps; s++) {
+			double angle = (-Math.PI / 2.0) - (Math.PI / 2.0) * (s / (double) arcSteps);
+			points.add(new double[]{cswX + r * Math.cos(angle), cswZ + r * Math.sin(angle)});
+		}
+
+		// 7. West straight edge (from SW to NW)
+		for (int s = 0; s < edgeSteps; s++) {
+			double t = s / (double) edgeSteps;
+			points.add(new double[]{cx - hw, cswZ + (cnwZ - cswZ) * t});
+		}
+
+		// 8. NW Arc (pi down to pi/2)
+		for (int s = 0; s < arcSteps; s++) {
+			double angle = Math.PI - (Math.PI / 2.0) * (s / (double) arcSteps);
+			points.add(new double[]{cnwX + r * Math.cos(angle), cnwZ + r * Math.sin(angle)});
+		}
+
+		return points;
 	}
 
 	private static KeyMapping.Category getGuiCategory() {
@@ -424,6 +677,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		addGuiCommand("fakeban trap", "Spawn Trap Base", "Pastes the fakeban trap base near you", false);
 		addGuiCommand("fakeban kick", "Test Fake Ban Kick", "Disconnects you with a fake permanent ban screen", false);
 		addGuiCommand("fakeban reset", "Reset Violations", "Resets your fake anti-cheat violation level to 0", false);
+		addGuiCommand("suschunks", "Sus Chunks (Fake)", "Toggles curved box overlay in random places at ground level", true);
 	}
 
 	private static void addGuiCommand(String cmd, String label, String desc, boolean isToggle) {
@@ -437,7 +691,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		String cmdName = prefix.isEmpty() ? node.getName() : prefix + " " + node.getName();
 		if (node.getCommand() != null) {
 			boolean isToggle = cmdName.equalsIgnoreCase("3x3") || cmdName.equalsIgnoreCase("fakeban")
-					|| cmdName.toLowerCase(Locale.ROOT).contains("toggle");
+					|| cmdName.equalsIgnoreCase("suschunks") || cmdName.toLowerCase(Locale.ROOT).contains("toggle");
 			addGuiCommand(cmdName, formatCmdLabel(cmdName), "Executes /" + cmdName, isToggle);
 		}
 		if (prefix.split(" ").length < 4) {
@@ -460,8 +714,27 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 	public static void executeGuiCommand(String cmd) {
 		Minecraft mc = Minecraft.getInstance();
+		String clean = cmd.startsWith("/") ? cmd.substring(1).trim() : cmd.trim();
+
+		// Client-side immediate state toggles for UI responsiveness
+		if (clean.equalsIgnoreCase("suschunks")) {
+			susChunksEnabled = !susChunksEnabled;
+			if (susChunksEnabled && SUS_SPOTS.isEmpty()) {
+				randomizeSusSpots();
+			}
+		} else if (clean.equalsIgnoreCase("suschunks color")) {
+			susColorIndex = (susColorIndex + 1) % SUS_COLORS.length;
+		} else if (clean.equalsIgnoreCase("suschunks opacity")) {
+			susOpacityIndex = (susOpacityIndex + 1) % SUS_OPACITIES.length;
+		} else if (clean.equalsIgnoreCase("suschunks curviness")) {
+			susCurvinessIndex = (susCurvinessIndex + 1) % SUS_CURVINESS.length;
+		} else if (clean.equalsIgnoreCase("suschunks height")) {
+			susHeightIndex = (susHeightIndex + 1) % SUS_HEIGHTS.length;
+		} else if (clean.equalsIgnoreCase("suschunks random")) {
+			randomizeSusSpots();
+		}
+
 		if (mc.player != null && mc.player.connection != null) {
-			String clean = cmd.startsWith("/") ? cmd.substring(1).trim() : cmd.trim();
 			mc.player.connection.sendCommand(clean);
 		}
 	}
@@ -473,6 +746,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		String clean = cmd.startsWith("/") ? cmd.substring(1).trim() : cmd.trim();
 		if (clean.equalsIgnoreCase("3x3")) return ENABLED_3X3.contains(id);
 		if (clean.equalsIgnoreCase("fakeban")) return ENABLED_FAKEBAN.contains(id);
+		if (clean.equalsIgnoreCase("suschunks")) return susChunksEnabled;
 		return false;
 	}
 
@@ -480,7 +754,8 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	// ClickGUI Screen Implementation (Vanilla Widgets for 100% Cross-Version Stability)
 	// ===============================================================================
 	public static class ClickGuiScreen extends Screen {
-		private static final int WIN_WIDTH = 250;
+		private static final int WIN_WIDTH = 260;
+		private static int activeTab = 0; // 0 = General Mods, 1 = Sus Chunks
 		private final Map<String, Button> buttons = new HashMap<>();
 
 		public ClickGuiScreen() {
@@ -498,30 +773,119 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 			buttons.clear();
 
 			int panelW = WIN_WIDTH;
-			int panelH = Math.min(320, this.height - 40);
+			int panelH = Math.min(330, this.height - 30);
 			int panelX = (this.width - panelW) / 2;
 			int panelY = (this.height - panelH) / 2;
 
 			int btnW = panelW - 24;
 			int btnH = 20;
-			int startY = panelY + 36;
-			int spacing = 24;
 
-			for (int i = 0; i < REGISTERED_COMMANDS.size(); i++) {
-				GuiCommand cmd = REGISTERED_COMMANDS.get(i);
-				int curY = startY + (i * spacing);
-				if (curY + btnH > panelY + panelH - 28) break;
+			// Tab Selector Buttons
+			int tabW = (btnW - 6) / 2;
+			Button tabMods = Button.builder(
+					Component.literal(activeTab == 0 ? "§b§l[⚡ General Mods]" : "§7⚡ General Mods"),
+					b -> { activeTab = 0; this.init(); }
+			).bounds(panelX + 12, panelY + 30, tabW, 18).build();
+			this.addRenderableWidget(tabMods);
 
-				Button btn = Button.builder(getButtonMessage(cmd), b -> {
-					executeGuiCommand(cmd.command);
+			Button tabSus = Button.builder(
+					Component.literal(activeTab == 1 ? "§d§l[🔮 Sus Chunks]" : "§7🔮 Sus Chunks"),
+					b -> { activeTab = 1; this.init(); }
+			).bounds(panelX + 12 + tabW + 6, panelY + 30, tabW, 18).build();
+			this.addRenderableWidget(tabSus);
+
+			int startY = panelY + 54;
+			int spacing = 23;
+
+			if (activeTab == 0) {
+				// General Mod commands
+				int displayIndex = 0;
+				for (int i = 0; i < REGISTERED_COMMANDS.size(); i++) {
+					GuiCommand cmd = REGISTERED_COMMANDS.get(i);
+					if (cmd.command.startsWith("suschunks")) continue; // shown in sus chunks tab
+
+					int curY = startY + (displayIndex * spacing);
+					if (curY + btnH > panelY + panelH - 26) break;
+
+					Button btn = Button.builder(getButtonMessage(cmd), b -> {
+						executeGuiCommand(cmd.command);
+						this.updateAllButtons();
+					})
+					.bounds(panelX + 12, curY, btnW, btnH)
+					.tooltip(Tooltip.create(Component.literal(cmd.description)))
+					.build();
+
+					this.addRenderableWidget(btn);
+					buttons.put(cmd.command, btn);
+					displayIndex++;
+				}
+			} else {
+				// Sus Chunks (Fake) Overlay Controls
+				// 1. Toggle Button
+				Button btnToggle = Button.builder(getSusToggleMessage(), b -> {
+					executeGuiCommand("suschunks");
 					this.updateAllButtons();
 				})
-				.bounds(panelX + 12, curY, btnW, btnH)
-				.tooltip(Tooltip.create(Component.literal(cmd.description)))
+				.bounds(panelX + 12, startY, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Toggles curved box overlay in random places at ground level (walk through)")))
 				.build();
+				this.addRenderableWidget(btnToggle);
+				buttons.put("suschunks_toggle", btnToggle);
 
-				this.addRenderableWidget(btn);
-				buttons.put(cmd.command, btn);
+				// 2. Color Button
+				Button btnColor = Button.builder(getSusColorMessage(), b -> {
+					executeGuiCommand("suschunks color");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY + spacing, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Click to cycle box overlay color (Cyan, Green, Red, Purple, Rainbow, etc.)")))
+				.build();
+				this.addRenderableWidget(btnColor);
+				buttons.put("suschunks_color", btnColor);
+
+				// 3. Opacity Button
+				Button btnOpacity = Button.builder(getSusOpacityMessage(), b -> {
+					executeGuiCommand("suschunks opacity");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY + spacing * 2, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Click to cycle box opacity & particle density (25%, 50%, 75%, 100%)")))
+				.build();
+				this.addRenderableWidget(btnOpacity);
+				buttons.put("suschunks_opacity", btnOpacity);
+
+				// 4. Curviness Button
+				Button btnCurve = Button.builder(getSusCurvinessMessage(), b -> {
+					executeGuiCommand("suschunks curviness");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY + spacing * 3, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Click to cycle corner curviness (Sharp 0°, Low, Medium, High, Circular)")))
+				.build();
+				this.addRenderableWidget(btnCurve);
+				buttons.put("suschunks_curviness", btnCurve);
+
+				// 5. Height Button
+				Button btnHeight = Button.builder(getSusHeightMessage(), b -> {
+					executeGuiCommand("suschunks height");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY + spacing * 4, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Click to cycle vertical height of the box (2, 4, 6, 8 blocks)")))
+				.build();
+				this.addRenderableWidget(btnHeight);
+				buttons.put("suschunks_height", btnHeight);
+
+				// 6. Randomize Spots Button
+				Button btnRandom = Button.builder(Component.literal("🎲 Randomize Spots  §b[RUN]"), b -> {
+					executeGuiCommand("suschunks random");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY + spacing * 5, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Picks new random locations near you for the curved sus chunk boxes")))
+				.build();
+				this.addRenderableWidget(btnRandom);
+				buttons.put("suschunks_random", btnRandom);
 			}
 
 			// Close button at bottom
@@ -532,12 +896,59 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		}
 
 		private void updateAllButtons() {
-			for (GuiCommand cmd : REGISTERED_COMMANDS) {
-				Button b = buttons.get(cmd.command);
-				if (b != null) {
-					b.setMessage(getButtonMessage(cmd));
+			if (activeTab == 0) {
+				for (GuiCommand cmd : REGISTERED_COMMANDS) {
+					Button b = buttons.get(cmd.command);
+					if (b != null) {
+						b.setMessage(getButtonMessage(cmd));
+					}
 				}
+			} else {
+				Button bToggle = buttons.get("suschunks_toggle");
+				if (bToggle != null) bToggle.setMessage(getSusToggleMessage());
+
+				Button bColor = buttons.get("suschunks_color");
+				if (bColor != null) bColor.setMessage(getSusColorMessage());
+
+				Button bOpacity = buttons.get("suschunks_opacity");
+				if (bOpacity != null) bOpacity.setMessage(getSusOpacityMessage());
+
+				Button bCurve = buttons.get("suschunks_curviness");
+				if (bCurve != null) bCurve.setMessage(getSusCurvinessMessage());
+
+				Button bHeight = buttons.get("suschunks_height");
+				if (bHeight != null) bHeight.setMessage(getSusHeightMessage());
 			}
+		}
+
+		private static Component getSusToggleMessage() {
+			MutableComponent c = Component.literal("Sus Chunks:  ");
+			if (susChunksEnabled) {
+				c.append(Component.literal("[ON]").withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD));
+			} else {
+				c.append(Component.literal("[OFF]").withStyle(ChatFormatting.RED, ChatFormatting.BOLD));
+			}
+			return c;
+		}
+
+		private static Component getSusColorMessage() {
+			return Component.literal("Color: ")
+					.append(Component.literal("[" + SUS_COLORS[susColorIndex] + "]").withStyle(ChatFormatting.YELLOW, ChatFormatting.BOLD));
+		}
+
+		private static Component getSusOpacityMessage() {
+			return Component.literal("Opacity: ")
+					.append(Component.literal("[" + SUS_OPACITIES[susOpacityIndex] + "]").withStyle(ChatFormatting.AQUA, ChatFormatting.BOLD));
+		}
+
+		private static Component getSusCurvinessMessage() {
+			return Component.literal("Curviness: ")
+					.append(Component.literal("[" + SUS_CURVINESS[susCurvinessIndex] + "]").withStyle(ChatFormatting.LIGHT_PURPLE, ChatFormatting.BOLD));
+		}
+
+		private static Component getSusHeightMessage() {
+			return Component.literal("Box Height: ")
+					.append(Component.literal("[" + SUS_HEIGHTS[susHeightIndex] + " Blocks]").withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD));
 		}
 
 		private static Component getButtonMessage(GuiCommand cmd) {
@@ -562,7 +973,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 			graphics.fill(0, 0, this.width, this.height, 0x66000000);
 
 			int panelW = WIN_WIDTH;
-			int panelH = Math.min(320, this.height - 40);
+			int panelH = Math.min(330, this.height - 30);
 			int panelX = (this.width - panelW) / 2;
 			int panelY = (this.height - panelH) / 2;
 
