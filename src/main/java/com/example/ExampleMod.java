@@ -54,6 +54,7 @@ import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.MultiBufferSource;
+import net.minecraft.client.renderer.RenderType;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.blocks.BlockStateParser;
@@ -171,7 +172,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	// ===============================================================================
 	// SUS CHUNKS (FAKE) 2D ROUNDED SQUARE CONFIGURATION & STATE
 	// ===============================================================================
-	public static boolean susChunksEnabled = false;
+	public static boolean susChunksEnabled = true;
 	public static boolean susAutoSpawn = true;    // automatically spawns a random sus chunk every 30s
 	private static int susAutoTimer = 0;          // counts ticks (600 ticks = 30 seconds)
 	public static int susColorIndex = 0;          // 0=Cyan (default matching screenshot), 1=Green, 2=Red, 3=Purple, 4=Yellow, 5=Orange, 6=White, 7=Rainbow
@@ -193,8 +194,8 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	public static final float[] SUS_OPACITY_VALUES = {0.25f, 0.50f, 0.75f, 1.00f};
 	public static final String[] SUS_CURVINESS = {"Sharp (0°)", "Low (R=1.5)", "Medium (R=3.0)", "High (R=5.0)", "Circular (R=7.5)"};
 	public static final float[] SUS_CURVE_VALUES = {0.0f, 1.5f, 3.0f, 5.0f, 7.5f};
-	public static final String[] SUS_HEIGHTS = {"Flush (+0.02)", "Raised (+0.25)", "Hover (+0.50)", "Waist (+1.00)"};
-	public static final double[] SUS_ELEVATION_OFFSETS = {0.02, 0.25, 0.50, 1.00};
+	public static final String[] SUS_HEIGHTS = {"Low (+0.10)", "Raised (+0.30)", "Hover (+0.60)", "Waist (+1.00)"};
+	public static final double[] SUS_ELEVATION_OFFSETS = {0.10, 0.30, 0.60, 1.00};
 
 	public static final class SusSpot {
 		public final int chunkX;
@@ -224,19 +225,26 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	public static void randomizeSusSpots() {
 		SUS_SPOTS.clear();
 		Minecraft client = Minecraft.getInstance();
-		int pChunkX = 0;
-		int pChunkZ = 0;
+		double px = 0;
+		double pz = 0;
 		if (client.player != null) {
-			pChunkX = client.player.getBlockX() >> 4;
-			pChunkZ = client.player.getBlockZ() >> 4;
+			px = client.player.getX();
+			pz = client.player.getZ();
 		}
-		ThreadLocalRandom rnd = ThreadLocalRandom.current();
-		for (int i = 0; i < 4; i++) {
-			int dx = rnd.nextInt(-5, 6);
-			int dz = rnd.nextInt(-5, 6);
-			if (dx == 0 && dz == 0) dx = 1;
-			SUS_SPOTS.add(new SusSpot(pChunkX + dx, pChunkZ + dz));
+		int pChunkX = ((int) Math.floor(px)) >> 4;
+		int pChunkZ = ((int) Math.floor(pz)) >> 4;
+
+		// Spawn 4 visible sus chunks 1 to 2 chunks away from the player
+		int[][] offsets = {
+				{1, 0},
+				{-1, 1},
+				{1, -2},
+				{-2, -1}
+		};
+		for (int[] off : offsets) {
+			SUS_SPOTS.add(new SusSpot(pChunkX + off[0], pChunkZ + off[1]));
 		}
+		LOGGER.info("[SusChunks] Generated {} sus chunks near player chunk [{}, {}]", SUS_SPOTS.size(), pChunkX, pChunkZ);
 	}
 
 	// ------------------------------------------------------------------ ClickGUI System
@@ -478,15 +486,41 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 				}
 			}
 
+			if (!worldRendererInitialized) {
+				initWorldRendering();
+			}
+
+			// Welcome message on first world load
+			if (!hasShownWelcome && client.player != null && client.level != null) {
+				hasShownWelcome = true;
+				client.player.displayClientMessage(
+						Component.literal("§d[🔮 Sus Chunks] §aActive! (Spots visible nearby | Auto-spawn 30s: ON | [Insert] for GUI)"),
+						false
+				);
+			}
+
 			// Automatically spawn a new random sus chunk spot every 30 seconds (600 ticks)
-			if (susChunksEnabled && susAutoSpawn && client.level != null && client.player != null) {
-				susAutoTimer++;
-				if (susAutoTimer >= 600) {
+			if (client.level != null && client.player != null) {
+				if (susChunksEnabled && susAutoSpawn) {
+					susAutoTimer++;
+					if (susAutoTimer >= 600) {
+						susAutoTimer = 0;
+						SusSpot newSpot = addRandomSusSpotNear(client.player.getX(), client.player.getZ());
+						if (newSpot != null) {
+							client.player.displayClientMessage(
+									Component.literal("§d[🔮 Sus Chunks] §aNew sus chunk spawned at chunk [" 
+											+ newSpot.chunkX + ", " + newSpot.chunkZ + "]! (X: " + (int)newSpot.centerX + ", Z: " + (int)newSpot.centerZ + ")"),
+									true
+							);
+							client.player.displayClientMessage(
+									Component.literal("§d[🔮 Sus Chunks] §e[30s Auto-Spawn] §aAdded new sus chunk at X=" + (int)newSpot.centerX + " Z=" + (int)newSpot.centerZ),
+									false
+							);
+						}
+					}
+				} else {
 					susAutoTimer = 0;
-					addRandomSusSpotNear(client.player.getX(), client.player.getZ());
 				}
-			} else {
-				susAutoTimer = 0;
 			}
 		});
 	}
@@ -495,10 +529,11 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	// SUS CHUNKS (FAKE) 2D ROUNDED SQUARE OVERLAY RENDERING (NO PARTICLES, PASSABLE)
 	// ===============================================================================
 	private static boolean worldRendererInitialized = false;
+	private static boolean hasLoggedRender = false;
+	private static boolean hasShownWelcome = false;
 
 	private static void initWorldRendering() {
 		if (worldRendererInitialized) return;
-		worldRendererInitialized = true;
 		try {
 			Class<?> eventsClass = null;
 			String[] candidateClassNames = {
@@ -511,27 +546,58 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 					if (eventsClass != null) break;
 				} catch (Throwable ignored) {}
 			}
-			if (eventsClass == null) return;
+			if (eventsClass == null) {
+				LOGGER.warn("[SusChunks] WorldRenderEvents class not found!");
+				return;
+			}
 
 			String[] eventFieldNames = {
-					"BEFORE_TRANSLUCENT",
 					"AFTER_ENTITIES",
-					"BEFORE_ENTITIES",
-					"BEFORE_DEBUG_RENDER",
-					"END_MAIN",
-					"START_MAIN"
+					"BEFORE_TRANSLUCENT",
+					"END_MAIN"
 			};
+
 			Field targetField = null;
+			Object eventObj = null;
+			Class<?> listenerType = null;
+
 			for (String fName : eventFieldNames) {
 				try {
-					targetField = eventsClass.getField(fName);
-					if (targetField != null) break;
+					Field f = eventsClass.getField(fName);
+					if (f != null) {
+						Object obj = f.get(null);
+						if (obj != null) {
+							// Match inner interface
+							String cleanName = fName.replace("_", "").toLowerCase(Locale.ROOT);
+							for (Class<?> inner : eventsClass.getDeclaredClasses()) {
+								if (inner.isInterface() && inner.getSimpleName().toLowerCase(Locale.ROOT).equals(cleanName)) {
+									targetField = f;
+									eventObj = obj;
+									listenerType = inner;
+									break;
+								}
+							}
+							if (listenerType == null) {
+								java.lang.reflect.Type gType = f.getGenericType();
+								if (gType instanceof java.lang.reflect.ParameterizedType pt) {
+									java.lang.reflect.Type[] pArgs = pt.getActualTypeArguments();
+									if (pArgs.length > 0 && pArgs[0] instanceof Class<?> c && c.isInterface()) {
+										targetField = f;
+										eventObj = obj;
+										listenerType = c;
+									}
+								}
+							}
+							if (listenerType != null) break;
+						}
+					}
 				} catch (Throwable ignored) {}
 			}
-			if (targetField == null) return;
 
-			Object eventObj = targetField.get(null);
-			if (eventObj == null) return;
+			if (targetField == null || eventObj == null || listenerType == null) {
+				LOGGER.warn("[SusChunks] Could not find valid WorldRenderEvents target field or interface!");
+				return;
+			}
 
 			Method regMethod = null;
 			for (Method m : eventObj.getClass().getMethods()) {
@@ -542,11 +608,14 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 			}
 			if (regMethod == null) return;
 
-			Class<?> listenerType = regMethod.getParameterTypes()[0];
+			Class<?> finalListenerType = listenerType;
 			Object proxyListener = Proxy.newProxyInstance(
-					ExampleMod.class.getClassLoader(),
-					new Class<?>[]{listenerType},
+					eventsClass.getClassLoader(),
+					new Class<?>[]{finalListenerType},
 					(proxy, method, args) -> {
+						if (method.getName().equals("toString")) return "SusChunksListener";
+						if (method.getName().equals("hashCode")) return 42;
+						if (method.getName().equals("equals")) return proxy == (args != null && args.length > 0 ? args[0] : null);
 						if (args != null && args.length > 0) {
 							renderSusChunksWorld(args[0]);
 						}
@@ -554,9 +623,11 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 					}
 			);
 			regMethod.invoke(eventObj, proxyListener);
-			LOGGER.info("[SusChunks] World render overlay hooked successfully via {}", targetField.getName());
+			worldRendererInitialized = true;
+			LOGGER.info("[SusChunks] World render overlay registered successfully on: {} with interface: {}",
+					targetField.getName(), finalListenerType.getName());
 		} catch (Throwable t) {
-			LOGGER.warn("[SusChunks] Could not hook world render events: {}", t.getMessage());
+			LOGGER.warn("[SusChunks] Could not hook world render events: {}", t.toString());
 		}
 	}
 
@@ -564,25 +635,43 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		if (!susChunksEnabled) return;
 		Minecraft client = Minecraft.getInstance();
 		if (client.level == null || client.player == null) return;
+
+		// Ensure spots are populated and near the player
 		if (SUS_SPOTS.isEmpty()) {
 			randomizeSusSpots();
+		} else {
+			boolean anyNear = false;
+			for (SusSpot sp : SUS_SPOTS) {
+				if (client.player.distanceToSqr(sp.centerX, client.player.getY(), sp.centerZ) <= 160.0 * 160.0) {
+					anyNear = true;
+					break;
+				}
+			}
+			if (!anyNear) {
+				randomizeSusSpots();
+			}
 		}
 
 		PoseStack poseStack = null;
 		try {
 			Method m = context.getClass().getMethod("matrices");
+			m.setAccessible(true);
 			poseStack = (PoseStack) m.invoke(context);
 		} catch (Throwable t1) {
 			try {
 				Method m = context.getClass().getMethod("matrixStack");
+				m.setAccessible(true);
 				poseStack = (PoseStack) m.invoke(context);
 			} catch (Throwable ignored) {}
 		}
-		if (poseStack == null) return;
+		if (poseStack == null) {
+			poseStack = new PoseStack();
+		}
 
 		Vec3 camPos = null;
 		try {
 			Method cm = context.getClass().getMethod("camera");
+			cm.setAccessible(true);
 			Object cam = cm.invoke(context);
 			if (cam != null) {
 				camPos = extractCameraPos(cam);
@@ -599,33 +688,44 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		}
 
 		if (camPos == null && client.player != null) {
-			camPos = client.player.position();
+			camPos = client.player.getEyePosition();
 		}
 		if (camPos == null) return;
 
 		MultiBufferSource consumers = null;
 		try {
 			Method m = context.getClass().getMethod("consumers");
+			m.setAccessible(true);
 			consumers = (MultiBufferSource) m.invoke(context);
 		} catch (Throwable ignored) {}
+
 		if (consumers == null && client.renderBuffers() != null) {
 			consumers = client.renderBuffers().bufferSource();
 		}
 		if (consumers == null) return;
 
-		Object renderType = getOverlayRenderType();
+		RenderType renderType = getOverlayRenderType();
 		if (renderType == null) return;
 
 		VertexConsumer consumer = null;
-		for (Method m : consumers.getClass().getMethods()) {
-			if (m.getName().equals("getBuffer") && m.getParameterCount() == 1) {
-				try {
-					consumer = (VertexConsumer) m.invoke(consumers, renderType);
-					if (consumer != null) break;
-				} catch (Throwable ignored) {}
+		try {
+			consumer = consumers.getBuffer(renderType);
+		} catch (Throwable t) {
+			for (Method m : consumers.getClass().getMethods()) {
+				if (m.getName().equals("getBuffer") && m.getParameterCount() == 1) {
+					try {
+						consumer = (VertexConsumer) m.invoke(consumers, renderType);
+						if (consumer != null) break;
+					} catch (Throwable ignored) {}
+				}
 			}
 		}
 		if (consumer == null) return;
+
+		if (!hasLoggedRender) {
+			hasLoggedRender = true;
+			LOGGER.info("[SusChunks] Overlay rendering active! Total spots: {}", SUS_SPOTS.size());
+		}
 
 		// Color calculation
 		float r, g, b;
@@ -649,66 +749,66 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		int fillR = (int) (r * 255.0f);
 		int fillG = (int) (g * 255.0f);
 		int fillB = (int) (b * 255.0f);
-		int fillA = Math.min(255, Math.max(15, (int) (opacity * 0.40f * 255.0f)));
+		int fillA = Math.min(255, Math.max(45, (int) (opacity * 0.55f * 255.0f)));
 
 		// Prominent border outline RGBA
 		int borderR = Math.min(255, (int) (r * 1.15f * 255.0f));
 		int borderG = Math.min(255, (int) (g * 1.15f * 255.0f));
 		int borderB = Math.min(255, (int) (b * 1.15f * 255.0f));
-		int borderA = Math.min(255, Math.max(50, (int) (opacity * 0.95f * 255.0f)));
+		int borderA = Math.min(255, Math.max(90, (int) (opacity * 0.95f * 255.0f)));
 
-		poseStack.pushPose();
-		poseStack.translate(-camPos.x, -camPos.y, -camPos.z);
-		Matrix4f matrix = poseStack.last().pose();
+		double borderWidth = 0.35;
 
-		double borderWidth = 0.28;
+		// Generate relative perimeter points centered at origin (0, 0)
+		List<double[]> outerPoints = get2DRoundedRectPoints(
+				-8.0, 8.0,
+				-8.0, 8.0,
+				curveRadius, 8
+		);
+
+		double innerR = Math.max(0.0, curveRadius - borderWidth);
+		List<double[]> innerPoints = get2DRoundedRectPoints(
+				-8.0 + borderWidth, 8.0 - borderWidth,
+				-8.0 + borderWidth, 8.0 - borderWidth,
+				(float) innerR, 8
+		);
+
+		int count = outerPoints.size();
 
 		for (int s = 0; s < SUS_SPOTS.size(); s++) {
 			SusSpot spot = SUS_SPOTS.get(s);
-			double distSq = client.player.distanceToSqr(spot.centerX, client.player.getY(), spot.centerZ);
+			double relX = spot.centerX - camPos.x;
+			double relZ = spot.centerZ - camPos.z;
+			double distSq = relX * relX + relZ * relZ;
 			if (distSq > 256.0 * 256.0) continue; // visible up to 256 blocks (16 chunks)
 
 			// Determine ground Y for this chunk spot
 			double groundY = getGroundYForSpot(client.level, client.player, spot) + elevationOffset;
+			double relY = groundY - camPos.y;
 
-			// Generate outer perimeter points (32 points around rounded square)
-			List<double[]> outerPoints = get2DRoundedRectPoints(
-					spot.minX, spot.maxX,
-					spot.minZ, spot.maxZ,
-					curveRadius, 8
-			);
+			poseStack.pushPose();
+			poseStack.translate(relX, relY, relZ);
+			Matrix4f matrix = poseStack.last().pose();
 
-			// Generate inner perimeter points for border outline ribbon
-			double innerR = Math.max(0.0, curveRadius - borderWidth);
-			List<double[]> innerPoints = get2DRoundedRectPoints(
-					spot.minX + borderWidth, spot.maxX - borderWidth,
-					spot.minZ + borderWidth, spot.maxZ - borderWidth,
-					(float) innerR, 8
-			);
-
-			int count = outerPoints.size();
-
-			// 1. Draw Translucent Filled Interior (Triangle Fan as Quads)
-			double cx = spot.centerX;
-			double cz = spot.centerZ;
+			// 1. Draw Translucent Filled Interior (Triangle Fan from local center 0, 0)
 			for (int i = 0; i < count; i++) {
 				double[] p1 = outerPoints.get(i);
 				double[] p2 = outerPoints.get((i + 1) % count);
 
 				// Front face (visible from above)
 				drawQuad(consumer, matrix,
-						cx, groundY, cz,
-						p1[0], groundY, p1[1],
-						p2[0], groundY, p2[1],
-						cx, groundY, cz,
+						0.0, 0.0, 0.0,
+						p1[0], 0.0, p1[1],
+						p2[0], 0.0, p2[1],
+						0.0, 0.0, 0.0,
 						fillR, fillG, fillB, fillA);
 
 				// Reverse face (visible from underneath)
 				drawQuad(consumer, matrix,
-						cx, groundY, cz,
-						p2[0], groundY, p2[1],
-						p1[0], groundY, p1[1],
-						cx, groundY, cz,
+						0.0, 0.0, 0.0,
+						p2[0], 0.0, p2[1],
+						p1[0], 0.0, p1[1],
+						0.0, 0.0, 0.0,
 						fillR, fillG, fillB, fillA);
 			}
 
@@ -721,32 +821,47 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 				// Top face border ribbon
 				drawQuad(consumer, matrix,
-					p1[0], groundY + 0.002, p1[1],
-					p2[0], groundY + 0.002, p2[1],
-					ip2[0], groundY + 0.002, ip2[1],
-					ip1[0], groundY + 0.002, ip1[1],
+					p1[0], 0.005, p1[1],
+					p2[0], 0.005, p2[1],
+					ip2[0], 0.005, ip2[1],
+					ip1[0], 0.005, ip1[1],
 					borderR, borderG, borderB, borderA);
 
 				// Bottom face border ribbon
 				drawQuad(consumer, matrix,
-					ip1[0], groundY + 0.002, ip1[1],
-					ip2[0], groundY + 0.002, ip2[1],
-					p2[0], groundY + 0.002, p2[1],
-					p1[0], groundY + 0.002, p1[1],
+					ip1[0], 0.005, ip1[1],
+					ip2[0], 0.005, ip2[1],
+					p2[0], 0.005, p2[1],
+					p1[0], 0.005, p1[1],
 					borderR, borderG, borderB, borderA);
 			}
+
+			poseStack.popPose();
 		}
 
-		poseStack.popPose();
+		// Flush batch to GPU
+		try {
+			if (consumers instanceof MultiBufferSource.BufferSource bs) {
+				bs.endBatch(renderType);
+			}
+		} catch (Throwable t) {
+			try {
+				if (consumers instanceof MultiBufferSource.BufferSource bs) {
+					bs.endBatch();
+				}
+			} catch (Throwable ignored) {}
+		}
 	}
 
 	private static Vec3 extractCameraPos(Object cam) {
 		try {
 			Method m = cam.getClass().getMethod("position");
+			m.setAccessible(true);
 			return (Vec3) m.invoke(cam);
 		} catch (Throwable t1) {
 			try {
 				Method m = cam.getClass().getMethod("getPosition");
+				m.setAccessible(true);
 				return (Vec3) m.invoke(cam);
 			} catch (Throwable ignored) {}
 		}
@@ -777,46 +892,33 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		} catch (Throwable ignored) {}
 	}
 
-	private static Object getOverlayRenderType() {
-		String[] typesClasses = {
-				"net.minecraft.client.renderer.rendertype.RenderTypes",
-				"net.minecraft.client.renderer.rendertype.RenderType",
-				"net.minecraft.client.renderer.RenderType"
-		};
-		String[] fieldCandidates = {
-				"LIGHTNING",
-				"DEBUG_QUADS",
-				"DEBUG_FILLED_BOX",
-				"LINES_TRANSLUCENT",
-				"TRANSLUCENT_MOVING_BLOCK"
-		};
-		String[] methodCandidates = {
-				"lightning",
-				"debugQuads",
-				"lines",
-				"translucentMovingBlock"
-		};
-
-		for (String className : typesClasses) {
+	private static RenderType getOverlayRenderType() {
+		try {
+			return RenderType.debugQuads();
+		} catch (Throwable t) {
 			try {
-				Class<?> clazz = Class.forName(className);
-				for (String fName : fieldCandidates) {
+				return RenderType.lightning();
+			} catch (Throwable t2) {
+				String[] typesClasses = {
+						"net.minecraft.client.renderer.RenderType",
+						"net.minecraft.client.renderer.rendertype.RenderTypes"
+				};
+				for (String cName : typesClasses) {
 					try {
-						Field f = clazz.getField(fName);
-						Object val = f.get(null);
-						if (val != null) return val;
+						Class<?> c = Class.forName(cName);
+						for (String mName : new String[]{"debugQuads", "lightning", "lines"}) {
+							try {
+								Method m = c.getMethod(mName);
+								m.setAccessible(true);
+								Object res = m.invoke(null);
+								if (res instanceof RenderType rt) return rt;
+							} catch (Throwable ignored) {}
+						}
 					} catch (Throwable ignored) {}
 				}
-				for (String mName : methodCandidates) {
-					try {
-						Method m = clazz.getMethod(mName);
-						Object val = m.invoke(null);
-						if (val != null) return val;
-					} catch (Throwable ignored) {}
-				}
-			} catch (Throwable ignored) {}
+				return null;
+			}
 		}
-		return null;
 	}
 
 	private static double getGroundYForSpot(ClientLevel level, Player player, SusSpot spot) {
@@ -826,19 +928,22 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 		int bx = (int) Math.floor(spot.centerX);
 		int bz = (int) Math.floor(spot.centerZ);
+		int py = (int) Math.floor(player.getY());
 
+		// 1. Surface heightmap check (standard world surface matching image-1.png)
 		try {
 			int groundY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, bx, bz);
 			if (groundY > level.getMinY()) {
-				spot.cachedGroundY = groundY + 0.02;
-				return spot.cachedGroundY;
-		}
+				if (Math.abs(py - groundY) <= 40 || py >= 50) {
+					spot.cachedGroundY = groundY + 0.02;
+					return spot.cachedGroundY;
+				}
+			}
 		} catch (Throwable ignored) {}
 
-		int refY = (int) player.getY();
-		int startY = Math.min(level.getMaxY() - 1, Math.max(level.getMinY() + 10, refY + 30));
-		int minY = Math.max(level.getMinY(), refY - 40);
-
+		// 2. If underground, scan down from player level to find local floor
+		int startY = Math.min(level.getMaxY() - 1, py + 5);
+		int minY = Math.max(level.getMinY(), py - 35);
 		BlockPos.MutableBlockPos mpos = new BlockPos.MutableBlockPos(bx, startY, bz);
 		for (int y = startY; y >= minY; y--) {
 			mpos.setY(y);
@@ -848,6 +953,15 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 				return spot.cachedGroundY;
 			}
 		}
+
+		// 3. Fallback to surface heightmap
+		try {
+			int groundY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, bx, bz);
+			if (groundY > level.getMinY()) {
+				spot.cachedGroundY = groundY + 0.02;
+				return spot.cachedGroundY;
+			}
+		} catch (Throwable ignored) {}
 
 		return player.getY() + 0.02;
 	}
@@ -887,15 +1001,19 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		return points;
 	}
 
-	public static void addRandomSusSpotNear(double px, double pz) {
+	public static SusSpot addRandomSusSpotNear(double px, double pz) {
 		int baseChunkX = ((int) Math.floor(px)) >> 4;
 		int baseChunkZ = ((int) Math.floor(pz)) >> 4;
-		int dx = ThreadLocalRandom.current().nextInt(-5, 6);
-		int dz = ThreadLocalRandom.current().nextInt(-5, 6);
-		SUS_SPOTS.add(new SusSpot(baseChunkX + dx, baseChunkZ + dz));
-		if (SUS_SPOTS.size() > 10) {
+		ThreadLocalRandom rnd = ThreadLocalRandom.current();
+		int dx = (rnd.nextBoolean() ? 1 : -1) * rnd.nextInt(1, 4);
+		int dz = (rnd.nextBoolean() ? 1 : -1) * rnd.nextInt(1, 4);
+		SusSpot spot = new SusSpot(baseChunkX + dx, baseChunkZ + dz);
+		SUS_SPOTS.add(spot);
+		if (SUS_SPOTS.size() > 12) {
 			SUS_SPOTS.remove(0);
 		}
+		LOGGER.info("[SusChunks] Added new random sus chunk at chunk [{}, {}]", spot.chunkX, spot.chunkZ);
+		return spot;
 	}
 
 	private static KeyMapping.Category getGuiCategory() {
