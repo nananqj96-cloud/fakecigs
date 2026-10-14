@@ -292,7 +292,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 			dispatcher.register(Commands.literal("fakebase").executes(ctx -> {
 				ServerPlayer p = ctx.getSource().getPlayerOrException();
-				spawnFakeBaseNear(p.serverLevel(), p.blockPosition(), false);
+				spawnFakeBaseNear(((ServerLevel) p.level()), p.blockPosition(), false);
 				p.sendSystemMessage(Component.literal("§aSpawning a random fake base near you..."));
 				return 1;
 			}));
@@ -435,6 +435,8 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 			while (guiKeyMapping.consumeClick()) {
 				if (client.screen == null) {
 					client.setScreen(new ClickGuiScreen(null));
+				} else if (client.screen instanceof ClickGuiScreen) {
+					client.setScreen(null);
 				}
 			}
 
@@ -835,21 +837,11 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		int bx = (int) Math.floor(spot.centerX);
 		int bz = (int) Math.floor(spot.centerZ);
 
-		int refY = (int) player.getY();
-		int startY = Math.min(level.getMaxBuildHeight() - 1, Math.max(level.getMinBuildHeight() + 10, refY + 30));
-		int minY = Math.max(level.getMinBuildHeight(), refY - 40);
-
-		BlockPos.MutableBlockPos mpos = new BlockPos.MutableBlockPos(bx, startY, bz);
-		for (int y = startY; y >= minY; y--) {
-			mpos.setY(y);
-			BlockState state = level.getBlockState(mpos);
-			if (!state.isAir() && state.getFluidState().isEmpty()) {
-				spot.cachedGroundY = y + 1.02; // rest directly on surface
-				return spot.cachedGroundY;
-			}
+		int groundY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, bx, bz);
+		if (groundY > level.getMinY()) {
+			spot.cachedGroundY = groundY + 0.02;
+			return spot.cachedGroundY;
 		}
-
-		// Chunk not yet loaded; don't cache yet, return player Y for now
 		return player.getY() + 0.02;
 	}
 
@@ -1206,15 +1198,6 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		}
 
 		@Override
-		public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-			if (keyCode == InputConstants.KEY_INSERT || keyCode == 256) { // Insert or Escape closes
-				this.onClose();
-				return true;
-			}
-			return super.keyPressed(keyCode, scanCode, modifiers);
-		}
-
-		@Override
 		public void onClose() {
 			if (this.minecraft != null) {
 				this.minecraft.setScreen(this.parent);
@@ -1266,8 +1249,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		if (hr instanceof BlockHitResult bhr) {
 			return bhr.getDirection();
 		}
-		Vec3 look = player.getLookAngle();
-		return Direction.getNearest(look.x, look.y, look.z);
+		return Direction.orderedByNearest(player)[0];
 	}
 
 	private static List<BlockPos> get3x3Positions(BlockPos center, Direction hitFace) {
@@ -1460,7 +1442,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	}
 
 	private static void triggerHeadScare(ServerPlayer p) {
-		ServerLevel level = p.serverLevel();
+		ServerLevel level = ((ServerLevel) p.level());
 		AdminSkin skin = ADMIN_SKINS[ThreadLocalRandom.current().nextInt(ADMIN_SKINS.length)];
 
 		Vec3 look = p.getLookAngle();
@@ -1481,7 +1463,6 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		stand.setNoGravity(true);
 		stand.noPhysics = true;
 		stand.setSilent(true);
-		stand.setSmall(true);
 
 		ItemStack head = new ItemStack(Items.PLAYER_HEAD);
 		applySkinToHead(head, skin);
@@ -1492,9 +1473,9 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 		level.playSound(null, p.getX(), p.getY(), p.getZ(), SoundEvents.WARDEN_HEARTBEAT, p.getSoundSource(), 1.0f, 0.8f);
 
-		runCmd(p.getServer(), "title " + p.getScoreboardName() + " times 10 40 10");
-		runCmd(p.getServer(), "title " + p.getScoreboardName() + " subtitle {\"text\":\"[ " + skin.name() + " is watching you ]\",\"color\":\"red\",\"bold\":true}");
-		runCmd(p.getServer(), "title " + p.getScoreboardName() + " title {\"text\":\"\"}");
+		run(p, "title @s times 10 40 10");
+		run(p, "title @s subtitle {\"text\":\"[ " + skin.name() + " is watching you ]\",\"color\":\"red\",\"bold\":true}");
+		run(p, "title @s title {\"text\":\"\"}");
 	}
 
 	private static void applySkinToHead(ItemStack head, AdminSkin skin) {
@@ -1508,7 +1489,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	}
 
 	private static void spawnTrapBase(ServerPlayer p) {
-		ServerLevel level = p.serverLevel();
+		ServerLevel level = ((ServerLevel) p.level());
 		Path file = FabricLoader.getInstance().getGameDir().resolve("schematics").resolve(FAKEBASE_FILE);
 		if (!Files.exists(file)) {
 			Path sub = FabricLoader.getInstance().getGameDir().resolve("schematics").resolve("fakebase").resolve(FAKEBASE_FILE);
@@ -1802,7 +1783,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	private static int cmdRtp(CommandSourceStack source) {
 		try {
 			ServerPlayer p = source.getPlayerOrException();
-			ServerLevel level = p.serverLevel();
+			ServerLevel level = ((ServerLevel) p.level());
 
 			for (int i = 0; i < RTP_TRIES; i++) {
 				double dist = ThreadLocalRandom.current().nextDouble(RTP_MIN, RTP_MAX);
@@ -1811,7 +1792,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 				int z = (int) (p.getZ() + Math.sin(angle) * dist);
 
 				int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z);
-				if (y <= level.getMinBuildHeight() + 2) continue;
+				if (y <= level.getMinY() + 2) continue;
 
 				BlockPos ground = new BlockPos(x, y - 1, z);
 				BlockState groundState = level.getBlockState(ground);
@@ -1830,15 +1811,15 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		return 0;
 	}
 
-	private static void runCmd(MinecraftServer s, String cmd) {
-		if (s == null) return;
+	private static void run(ServerPlayer p, String command) {
+		if (!(p.level() instanceof ServerLevel level)) return;
 		try {
-			CommandSourceStack stack = s.createCommandSourceStack()
-					.withPermission(PermissionSet.ALL)
+			CommandSourceStack src = p.createCommandSourceStack()
+					.withLevel(level)
 					.withSuppressedOutput();
-			s.getCommands().performPrefixedCommand(stack, cmd);
+			level.getServer().getCommands().performPrefixedCommand(src, command);
 		} catch (Throwable t) {
-			LOGGER.debug("Command execution notice: {}", t.getMessage());
+			LOGGER.debug("Command notice: {}", t.getMessage());
 		}
 	}
 
