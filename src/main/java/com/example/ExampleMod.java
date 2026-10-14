@@ -741,7 +741,6 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		return points;
 	}
 
-
 	private static void registerDefaultGuiCommands() {
 		addGuiCommand("3x3", "3x3 Mining", "Toggles 3x3 pickaxe mining mode (hold sneak to mine 1 block)", true);
 		addGuiCommand("fakeban", "Fake Anti-Cheat", "Toggles fake anti-cheat watcher and traps", true);
@@ -1422,7 +1421,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		stand.setInvisible(true);
 		stand.setNoGravity(true);
 		stand.setSilent(true);
-		stand.noPhysics = true);
+		stand.noPhysics = true;
 		stand.setSmall(false);
 
 		ItemStack skull = new ItemStack(Items.PLAYER_HEAD);
