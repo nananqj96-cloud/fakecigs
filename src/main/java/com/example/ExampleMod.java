@@ -90,6 +90,7 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 import org.joml.Matrix4f;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -98,47 +99,74 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
 	// ===============================================================================
-	// CONFIGURATION
+	// CONFIGURATION - change these numbers if you want
 	// ===============================================================================
-	private static final int TRIGGER_Y = -40;            // fake anti-cheat deep mining bonus threshold
+	private static final int TRIGGER_Y = -40;            // only used by the fake anti-cheat's deep mining bonus (unchanged)
 	private static final int BASE_TRIGGER_Y = -10;       // random fake bases can spawn when mining BELOW this Y
 	private static final double CHANCE = 1.0;            // 100% chance per block mined (spawns when not on cooldown)
-	private static final long COOLDOWN_MS = 60_000L;     // wait 60 seconds between bases
-	private static final int MAX_RADIUS = 30;            // search up to 30 blocks away for clear space
-	private static final int MIN_BUILD_Y = -58;          // stay above bedrock
-	private static final int MAX_VOLUME = 3_000_000;
-	private static final int BLOCKS_PER_TICK = 6000;
-	private static final int TILES_PER_TICK = 40;
-	private static final int DOWN_DEPTH = 3;
-	private static final int WALL_DEPTH = 1;
-	private static final boolean DEBUG_LOG = true;
+	private static final long COOLDOWN_MS = 60_000L;     // wait at least 1 minute (60 seconds) between fake bases
+	private static final int MIN_GAP = 12;               // at least this many blocks away from the player
+	private static final int EXTRA_RANGE = 20;           // plus 0 to this many extra blocks (total 12..32)
+	private static final int MIN_BUILD_Y = -58;          // never build below this (stay above bedrock)
+	private static final int MAX_VOLUME = 3_000_000;     // skip schematics bigger than this many blocks
+	private static final int BLOCKS_PER_TICK = 6000;     // placement speed (lower = less lag)
+	private static final int TILES_PER_TICK = 40;        // chests / entities handled per tick after the blocks are placed
+	private static final int DOWN_DEPTH = 3;             // 3x3 mining up/down: how many blocks deep (column + left + right columns)
+	private static final int WALL_DEPTH = 1;             // 3x3 mining a wall: 1 = flat 3x3 plane
+	private static final boolean DEBUG_LOG = true;       // prints why a fake base did / did not spawn into latest.log
 
 	// ---- /fakeban (fake anti-cheat) ----
-	private static final String FAKEBASE_FILE = "fakebase.litematic";
-	private static final double VL_WATCH = 20.0;
-	private static final double VL_TRAP = 20.0;
-	private static final int TRAP_DELAY_TICKS = 400;
-	private static final double VL_DECAY_PER_SEC = 0.5;
-	private static final double VL_PER_BLOCK = 0.15;
-	private static final double VL_DEEP_BONUS = 0.10;
-	private static final double VL_PER_EXTRA = 0.35;
-	private static final double VL_FAST = 1.0;
-	private static final int FAST_BREAKS = 10;
-	private static final double VL_FLY = 2.0;
-	private static final double VL_SPEED = 1.5;
-	private static final double SPEED_LIMIT = 14.0;
-	private static final double VL_RTP = 6.0;
-	private static final int HEAD_TICKS = 50;
-	private static final double TRAP_ENTER_DIST = 1.0;
-	private static final double TRAP_MINE_DIST = 3.0;
-	private static final double TRAP_APPROACH_RANGE = 16.0;
-	private static final int TRAP_APPROACH_BREAKS = 6;
+	private static final String FAKEBASE_FILE = "fakebase.litematic"; // the trap base (put it in the 'schematics' folder)
+	private static final double VL_WATCH = 20.0;         // violation level that makes the "admin" look at you (head passes the screen)
+	private static final double VL_TRAP = 20.0;          // violation level (after being watched) that spawns the trap base
+	private static final int TRAP_DELAY_TICKS = 400;     // at least 20 seconds between the head pass and the trap base
+	private static final double VL_DECAY_PER_SEC = 0.5;  // violation level that wears off every second
+	private static final double VL_PER_BLOCK = 0.15;     // every block you mine
+	private static final double VL_DEEP_BONUS = 0.10;    // extra when mining at/below TRIGGER_Y
+	private static final double VL_PER_EXTRA = 0.35;     // per extra block broken by 3x3 mining (capped at 3.0 per break)
+	private static final double VL_FAST = 1.0;           // extra per block when mining way too fast
+	private static final int FAST_BREAKS = 10;           // this many blocks in 3 seconds counts as "too fast"
+	private static final double VL_FLY = 2.0;            // per second while flying in survival
+	private static final double VL_SPEED = 1.5;          // per second while moving too fast on foot
+	private static final double SPEED_LIMIT = 14.0;      // blocks per second considered "too fast" on foot
+	private static final double VL_RTP = 6.0;            // using /rtp looks like a teleport hack
+	private static final int HEAD_TICKS = 50;            // how long the head takes to cross the screen (50 ticks = 2.5 seconds)
+	private static final double TRAP_ENTER_DIST = 1.0;   // closer than this to the trap base = kicked
+	private static final double TRAP_MINE_DIST = 3.0;    // mining a block closer than this to the trap base = kicked
+	private static final double TRAP_APPROACH_RANGE = 16.0; // "mining towards it" is only checked inside this range
+	private static final int TRAP_APPROACH_BREAKS = 6;   // this many blocks in a row getting closer = kicked
 	private static final String APPEAL_URL = "support.donutsmp.net";
 
 	// ---- /rtp ----
-	private static final int RTP_MIN = 500;
-	private static final int RTP_MAX = 5000;
-	private static final int RTP_TRIES = 25;
+	private static final int RTP_MIN = 500;              // minimum distance of the random teleport
+	private static final int RTP_MAX = 5000;             // maximum distance of the random teleport
+	private static final int RTP_TRIES = 25;             // how many random spots to try before giving up
+	// ===============================================================================
+
+	private static Job activeJob = null;
+	private static long nextAllowed = 0L;
+
+	// shuffle bag for the random fake bases (every base is used once before any repeats)
+	private static final List<Path> BAG = new ArrayList<>();
+	private static Path lastBase = null;
+
+	// 3x3 mining state (only touched on the server thread)
+	private static final Set<UUID> ENABLED_3X3 = new HashSet<>();
+	private static final Map<UUID, Direction> PENDING_FACE = new HashMap<>();
+	private static boolean breakingExtra = false;
+	private static int extraBroken = 0;
+
+	// fake anti-cheat state (only touched on the server thread)
+	private static final Set<UUID> ENABLED_FAKEBAN = new HashSet<>();
+	private static final Map<UUID, Watch> WATCH = new HashMap<>();
+	private static final Map<UUID, HeadAnim> HEADS = new HashMap<>();
+	private static Trap trap = null;
+	private static int cmdErrors = 0;
+
+	private static final Skin[] SKINS = {
+			new Skin("Pastagamer08", UUID.fromString("5cff4acd-fda7-413a-a369-a0928b5c70c9")),
+			new Skin("WiZoX", UUID.fromString("77482a7d-e661-4927-8641-ee5c62245dd1"))
+	};
 
 	// ===============================================================================
 	// SUS CHUNKS (FAKE) 2D ROUNDED SQUARE CONFIGURATION & STATE
@@ -146,11 +174,10 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	public static boolean susChunksEnabled = false;
 	public static boolean susAutoSpawn = true;    // automatically spawns a random sus chunk every 30s
 	private static int susAutoTimer = 0;          // counts ticks (600 ticks = 30 seconds)
-
 	public static int susColorIndex = 0;          // 0=Cyan (default matching screenshot), 1=Green, 2=Red, 3=Purple, 4=Yellow, 5=Orange, 6=White, 7=Rainbow
 	public static int susOpacityIndex = 2;        // 0=25%, 1=50%, 2=75%, 3=100%
-	public static int susCurvinessIndex = 2;      // 0=Sharp (0), 1=Low (R=1.5), 2=Medium (R=3.0), 3=High (R=5.0), 4=Circular (R=7.5)
-	public static int susElevationIndex = 0;      // 0=Flush Ground (+0.02), 1=Raised (+0.25), 2=Hover (+0.50), 3=Waist (+1.00)
+	public static int susCurvinessIndex = 2;      // 0=Sharp (0°), 1=Low (R=1.5), 2=Medium (R=3.0), 3=High (R=5.0), 4=Circular (R=7.5)
+	public static int susHeightIndex = 0;         // 0=Flush Ground (+0.02), 1=Raised (+0.25), 2=Hover (+0.50), 3=Waist (+1.00)
 
 	public static final String[] SUS_COLORS = {"Cyan (Default)", "Green", "Red", "Purple", "Yellow", "Orange", "White", "Rainbow (Chroma)"};
 	public static final float[][] SUS_COLOR_RGB = {
@@ -158,24 +185,18 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 			{0.15f, 0.95f, 0.35f}, // Green (#26F259)
 			{1.00f, 0.20f, 0.25f}, // Red (#FF3340)
 			{0.75f, 0.25f, 1.00f}, // Purple (#BF40FF)
-			{1.00f, 0.90f, 0.15f}, // Yellow (#FFE626)
-			{1.00f, 0.55f, 0.10f}, // Orange (#FF8C1A)
-			{0.95f, 0.98f, 1.00f}, // White
-			{1.00f, 1.00f, 1.00f}  // Rainbow (dynamic HSB)
+			{1.00f, 0.90f, 0.10f}, // Yellow (#FFE61A)
+			{1.00f, 0.55f, 0.05f}, // Orange (#FF8C0D)
+			{1.00f, 1.00f, 1.00f}  // White (#FFFFFF)
 	};
-
-	public static final String[] SUS_OPACITIES = {"25% (Subtle)", "50% (Medium)", "75% (Vibrant)", "100% (Solid)"};
+	public static final String[] SUS_OPACITIES = {"25%", "50%", "75%", "100%"};
 	public static final float[] SUS_OPACITY_VALUES = {0.25f, 0.50f, 0.75f, 1.00f};
-
-	public static final String[] SUS_CURVINESS = {"Sharp Corners (0°)", "Low Curvature (R=1.5)", "Medium Curvature (R=3.0)", "High Curvature (R=5.0)", "Circular (R=7.5)"};
+	public static final String[] SUS_CURVINESS = {"Sharp (0°)", "Low (R=1.5)", "Medium (R=3.0)", "High (R=5.0)", "Circular (R=7.5)"};
 	public static final float[] SUS_CURVE_VALUES = {0.0f, 1.5f, 3.0f, 5.0f, 7.5f};
+	public static final String[] SUS_HEIGHTS = {"Flush (+0.02)", "Raised (+0.25)", "Hover (+0.50)", "Waist (+1.00)"};
+	public static final double[] SUS_ELEVATION_OFFSETS = {0.02, 0.25, 0.50, 1.00};
 
-	public static final String[] SUS_ELEVATIONS = {"Flush Surface (+0.02)", "Slightly Raised (+0.25)", "Hovering (+0.50)", "Waist Height (+1.00)"};
-	public static final double[] SUS_ELEVATION_VALUES = {0.02, 0.25, 0.50, 1.00};
-
-	public static final List<SusSpot> SUS_SPOTS = new ArrayList<>();
-
-	public static class SusSpot {
+	public static final class SusSpot {
 		public final int chunkX;
 		public final int chunkZ;
 		public final double minX;
@@ -198,116 +219,90 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		}
 	}
 
-	private static Job activeJob = null;
-	private static long nextAllowed = 0L;
-	private static final Set<UUID> ENABLED_3X3 = new HashSet<>();
-	private static final Set<UUID> RECURSION_GUARD = new HashSet<>();
-	private static final Map<UUID, PlayerState> STATES = new HashMap<>();
-	private static final List<HeadPass> ACTIVE_HEADS = new ArrayList<>();
-	private static final List<TrapBase> ACTIVE_TRAPS = new ArrayList<>();
+	public static final List<SusSpot> SUS_SPOTS = new ArrayList<>();
 
-	private static final AdminSkin[] ADMIN_SKINS = {
-			new AdminSkin("drdonuts", "99ba64e4-c119-4cb5-8d57-b248eb3fb020",
-					"ewogICJ0aW1lc3RhbXAiIDogMTcwODcxNDkyNzg2OSwKICAicHJvZmlsZUlkIiA6ICI5OWJhNjRlNGMxMTk0Y2I1OGQ1N2IyNDhlYjNmYjAyMCIsCiAgInByb2ZpbGVOYW1lIiA6ICJkcmRvbnV0cyIsCiAgInNpZ25hdHVyZVJlcXVpcmVkIiA6IHRydWUsCiAgInRleHR1cmVzIiA6IHsKICAgICJTS0lOIiA6IHsKICAgICAgInVybCIgOiAiaHR0cDovL3RleHR1cmVzLm1pbmVjcmFmdC5uZXQvdGV4dHVyZS82NGVhOTJmMjdmMDhiOGRlNzQ2Y2M2YzlkMmUyNzI2MWY5OTY4OGU0YTM4MjA5YjFmOGNmNzFjYjA0NTRjMjA0IgogICAgfQogIH0KfQ=="),
-			new AdminSkin("SammyCheez", "7f14bfa4-0461-4aa2-944f-c0067ffbc989",
-					"ewogICJ0aW1lc3RhbXAiIDogMTYyNzc4NDMyNTE5NiwKICAicHJvZmlsZUlkIiA6ICI3ZjE0YmZhNDA0NjE0YWEyOTQ0ZmMwMDY3ZmZiYzk4OSIsCiAgInByb2ZpbGVOYW1lIiA6ICJTYW1teUNoZWV6IiwKICAic2lnbmF0dXJlUmVxdWlyZWQiIDogdHJ1ZSwKICAidGV4dHVyZXMiIDogewogICAgIlNLSU4iIDogewogICAgICAidXJsIiA6ICJodHRwOi8vdGV4dHVyZXMubWluZWNyYWZ0Lm5ldC90ZXh0dXJlLzVhMWE3NmJjYTg2NzFhMDRhMjFjYjFiYWE0MjYzNTU1N2M1ZTQ0YTg1OWI0ZWM1ZjEwNzNmNGVkNjc1MDVhOGIiCiAgICB9CiAgfQp9"),
-			new AdminSkin("drpeppas", "a8607fa6-2f00-4ea1-b27e-399fa37812ec",
-					"ewogICJ0aW1lc3RhbXAiIDogMTY4Mzg2NjI2MjA5NCwKICAicHJvZmlsZUlkIiA6ICJhODYwN2ZhNjJmMDA0ZWExYjI3ZTM5OWZhMzc4MTJlYyIsCiAgInByb2ZpbGVOYW1lIiA6ICJkcnBlcHBhcyIsCiAgInNpZ25hdHVyZVJlcXVpcmVkIiA6IHRydWUsCiAgInRleHR1cmVzIiA6IHsKICAgICJTS0lOIiA6IHsKICAgICAgInVybCIgOiAiaHR0cDovL3RleHR1cmVzLm1pbmVjcmFmdC5uZXQvdGV4dHVyZS85OGQ5YzFkNWFiOTdmZWRhOTY3MWNlYTVkMzYzNmYwNGEzNmQ1NWNhMTIxNDcyMDNmNTA4ZDkzNWIwODJjYzg5IgogICAgfQogIH0KfQ=="),
-			new AdminSkin("swoopdd", "49ec1782-bdf9-42b4-82a1-faad1c8939c3",
-					"ewogICJ0aW1lc3RhbXAiIDogMTcwODcxNDkyNzg2OSwKICAicHJvZmlsZUlkIiA6ICI0OWVjMTc4MmJkZjktNDJiNC04MmExLWZhYWQxYzg5MzljMyIsCiAgInByb2ZpbGVOYW1lIiA6ICJzd29vcGRkIiwKICAic2lnbmF0dXJlUmVxdWlyZWQiIDogdHJ1ZSwKICAidGV4dHVyZXMiIDogewogICAgIlNLSU4iIDogewogICAgICAidXJsIiA6ICJodHRwOi8vdGV4dHVyZXMubWluZWNyYWZ0Lm5ldC90ZXh0dXJlL2QzM2I2ZTU5MThjYmQ4ZmM1NGMxMGY5MDlmZjIzMmFhNTBlNDQxYjc1YTE5ZDcyYmM5ODk0MWY4YTg5YjNiN2EiCiAgICB9CiAgfQp9")
-	};
+	public static void randomizeSusSpots() {
+		SUS_SPOTS.clear();
+		Minecraft client = Minecraft.getInstance();
+		int pChunkX = 0;
+		int pChunkZ = 0;
+		if (client.player != null) {
+			pChunkX = client.player.getBlockX() >> 4;
+			pChunkZ = client.player.getBlockZ() >> 4;
+		}
+		ThreadLocalRandom rnd = ThreadLocalRandom.current();
+		for (int i = 0; i < 4; i++) {
+			int dx = rnd.nextInt(-5, 6);
+			int dz = rnd.nextInt(-5, 6);
+			if (dx == 0 && dz == 0) dx = 1;
+			SUS_SPOTS.add(new SusSpot(pChunkX + dx, pChunkZ + dz));
+		}
+	}
 
-	public static KeyMapping guiKeyMapping;
-	public static final Map<String, CommandUiEntry> DISCOVERED_COMMANDS = new TreeMap<>();
-
-	public static class CommandUiEntry {
-		public final String commandName;
-		public final String fullCommand;
+	// ------------------------------------------------------------------ ClickGUI System
+	public static final class GuiCommand {
+		public final String command;
+		public final String label;
+		public final String description;
 		public final boolean isToggle;
 
-		public CommandUiEntry(String commandName, String fullCommand, boolean isToggle) {
-			this.commandName = commandName;
-			this.fullCommand = fullCommand;
+		public GuiCommand(String command, String label, String description, boolean isToggle) {
+			this.command = command;
+			this.label = label;
+			this.description = description;
 			this.isToggle = isToggle;
 		}
 	}
 
+	public static final List<GuiCommand> REGISTERED_COMMANDS = new ArrayList<>();
+	private static KeyMapping guiKeyMapping = null;
+	private static boolean clientInitialized = false;
+
 	@Override
 	public void onInitialize() {
-		LOGGER.info("ExampleMod initializing with all chat commands intact, auto-discovery GUI, and 2D ground sus chunks overlay.");
-
-		PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, blockEntity) -> {
-			if (world.isClientSide()) return;
-			if (!(world instanceof ServerLevel serverLevel)) return;
-			if (!(player instanceof ServerPlayer serverPlayer)) return;
-
-			// Handle /3x3 mining
-			if (ENABLED_3X3.contains(player.getUUID())) {
-				handle3x3Break(serverLevel, serverPlayer, pos, state);
-			}
-
-			// Fake Anti-Cheat VL tracking
-			onPlayerMineBlock(serverPlayer, pos);
-
-			// Mining below BASE_TRIGGER_Y spawns a random fake base with 60s cooldown
-			if (pos.getY() < BASE_TRIGGER_Y) {
-				long now = System.currentTimeMillis();
-				if (now >= nextAllowed) {
-					if (ThreadLocalRandom.current().nextDouble() < CHANCE) {
-						spawnFakeBaseNear(serverLevel, pos, false);
-					}
-				}
-			}
-		});
-
-		ServerTickEvents.END_SERVER_TICK.register(server -> {
-			tickActiveJob();
-			tickFakeAntiCheat(server);
-		});
-
-		ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
-			activeJob = null;
-			STATES.clear();
-			ACTIVE_HEADS.clear();
-			ACTIVE_TRAPS.clear();
-		});
-
-		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
-			STATES.put(handler.getPlayer().getUUID(), new PlayerState());
-		});
+		// Populate initial known commands
+		registerDefaultGuiCommands();
 
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+			Set<String> before = new HashSet<>();
+			for (CommandNode<CommandSourceStack> node : dispatcher.getRoot().getChildren()) {
+				before.add(node.getName());
+			}
+
+			// ---- /3x3 command (toggle) ----
 			dispatcher.register(Commands.literal("3x3").executes(ctx -> {
-				ServerPlayer p = ctx.getSource().getPlayerOrException();
-				UUID id = p.getUUID();
-				if (ENABLED_3X3.contains(id)) {
-					ENABLED_3X3.remove(id);
-					p.sendSystemMessage(Component.literal("§6[3x3 Mining] §cDisabled"));
-				} else {
-					ENABLED_3X3.add(id);
-					p.sendSystemMessage(Component.literal("§6[3x3 Mining] §aEnabled (3x3 tunneling active)"));
+				CommandSourceStack src = ctx.getSource();
+				ServerPlayer p = src.getPlayerOrException();
+				if (src.getServer().isDedicatedServer()) {
+					src.sendSuccess(() -> Component.literal("3x3 mining only works in singleplayer."), false);
+					return 0;
 				}
+				UUID id = p.getUUID();
+				boolean nowOn = !ENABLED_3X3.remove(id);
+				if (nowOn) ENABLED_3X3.add(id);
+				String msg = nowOn
+						? "3x3 mining: ON (hold a pickaxe, sneak to mine a single block)"
+						: "3x3 mining: OFF";
+				src.sendSuccess(() -> Component.literal(msg), false);
 				return 1;
 			}));
 
-			dispatcher.register(Commands.literal("fakebase").executes(ctx -> {
-				ServerPlayer p = ctx.getSource().getPlayerOrException();
-				spawnFakeBaseNear(((ServerLevel) p.level()), p.blockPosition(), false);
-				p.sendSystemMessage(Component.literal("§aSpawning a random fake base near you..."));
-				return 1;
-			}));
+			// ---- /fakebase : TEST COMMAND ----
+			dispatcher.register(Commands.literal("fakebase").executes(ctx -> cmdFakeBase(ctx.getSource())));
 
-			dispatcher.register(Commands.literal("fakeban").executes(ctx -> {
-				ServerPlayer p = ctx.getSource().getPlayerOrException();
-				PlayerState st = getState(p.getUUID());
-				st.enabled = !st.enabled;
-				p.sendSystemMessage(Component.literal("§c[FakeAntiCheat] " + (st.enabled ? "§aENABLED for you" : "§cDISABLED for you")));
-				return 1;
-			}));
+			// ---- /fakeban (toggle) + test subcommands ----
+			dispatcher.register(Commands.literal("fakeban")
+					.executes(ctx -> cmdFakeBan(ctx.getSource()))
+					.then(Commands.literal("status").executes(ctx -> cmdFakeBanStatus(ctx.getSource())))
+					.then(Commands.literal("watch").executes(ctx -> cmdFakeBanWatch(ctx.getSource())))
+					.then(Commands.literal("trap").executes(ctx -> cmdFakeBanTrap(ctx.getSource())))
+					.then(Commands.literal("kick").executes(ctx -> cmdFakeBanKick(ctx.getSource())))
+					.then(Commands.literal("reset").executes(ctx -> cmdFakeBanReset(ctx.getSource()))));
 
+			// ---- /rtp ----
 			dispatcher.register(Commands.literal("rtp").executes(ctx -> cmdRtp(ctx.getSource())));
 
-			// ---- /suschunks : Fake Sus Chunks overlay commands ----
+			// ---- /suschunks : Fake Sus Chunks 2D rounded square overlay ----
 			dispatcher.register(Commands.literal("suschunks")
 					.executes(ctx -> {
 						susChunksEnabled = !susChunksEnabled;
@@ -316,7 +311,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 						}
 						susAutoTimer = 0;
 						ctx.getSource().sendSuccess(
-								() -> Component.literal("§d[🔮 Sus Chunks] Overlay: " + (susChunksEnabled ? "§aENABLED" : "§cDISABLED")),
+								() -> Component.literal("Fake Sus Chunks overlay: " + (susChunksEnabled ? "§aENABLED" : "§cDISABLED")),
 								false
 						);
 						return 1;
@@ -327,116 +322,159 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 						ctx.getSource().sendSuccess(() -> Component.literal("Sus Chunks Auto-Spawn (30s): " + (susAutoSpawn ? "§aENABLED" : "§cDISABLED")), false);
 						return 1;
 					}))
-					.then(Commands.literal("randomize").executes(ctx -> {
-						randomizeSusSpots();
-						ctx.getSource().sendSuccess(() -> Component.literal("§d[🔮 Sus Chunks] §aGenerated new random sus spots near you!"), false);
-						return 1;
-					}))
 					.then(Commands.literal("color").executes(ctx -> {
 						susColorIndex = (susColorIndex + 1) % SUS_COLORS.length;
-						ctx.getSource().sendSuccess(() -> Component.literal("§d[🔮 Sus Chunks] Color set to: §b" + SUS_COLORS[susColorIndex]), false);
+						ctx.getSource().sendSuccess(() -> Component.literal("Sus Chunks Color: §e" + SUS_COLORS[susColorIndex]), false);
 						return 1;
 					}))
 					.then(Commands.literal("opacity").executes(ctx -> {
 						susOpacityIndex = (susOpacityIndex + 1) % SUS_OPACITIES.length;
-						ctx.getSource().sendSuccess(() -> Component.literal("§d[🔮 Sus Chunks] Opacity set to: §b" + SUS_OPACITIES[susOpacityIndex]), false);
+						ctx.getSource().sendSuccess(() -> Component.literal("Sus Chunks Opacity: §e" + SUS_OPACITIES[susOpacityIndex]), false);
 						return 1;
 					}))
-					.then(Commands.literal("curve").executes(ctx -> {
+					.then(Commands.literal("curviness").executes(ctx -> {
 						susCurvinessIndex = (susCurvinessIndex + 1) % SUS_CURVINESS.length;
-						ctx.getSource().sendSuccess(() -> Component.literal("§d[🔮 Sus Chunks] Curviness set to: §b" + SUS_CURVINESS[susCurvinessIndex]), false);
+						ctx.getSource().sendSuccess(() -> Component.literal("Sus Chunks Curviness: §e" + SUS_CURVINESS[susCurvinessIndex]), false);
 						return 1;
 					}))
-					.then(Commands.literal("elevation").executes(ctx -> {
-						susElevationIndex = (susElevationIndex + 1) % SUS_ELEVATIONS.length;
-						ctx.getSource().sendSuccess(() -> Component.literal("§d[🔮 Sus Chunks] Ground Elevation set to: §b" + SUS_ELEVATIONS[susElevationIndex]), false);
+					.then(Commands.literal("height").executes(ctx -> {
+						susHeightIndex = (susHeightIndex + 1) % SUS_HEIGHTS.length;
+						ctx.getSource().sendSuccess(() -> Component.literal("Sus Chunks Height: §e" + SUS_HEIGHTS[susHeightIndex] + " Blocks"), false);
+						return 1;
+					}))
+					.then(Commands.literal("random").executes(ctx -> {
+						randomizeSusSpots();
+						ctx.getSource().sendSuccess(() -> Component.literal("Generated new random Sus Chunk locations near you."), false);
 						return 1;
 					}))
 			);
 
-			// Automatically register built-in commands
-			registerDiscoveredCommand("3x3", "/3x3", true);
-			registerDiscoveredCommand("fakebase", "/fakebase", false);
-			registerDiscoveredCommand("fakeban", "/fakeban", true);
-			registerDiscoveredCommand("rtp", "/rtp", false);
-			registerDiscoveredCommand("suschunks", "/suschunks", true);
-			registerDiscoveredCommand("suschunks auto", "/suschunks auto", true);
-			registerDiscoveredCommand("suschunks randomize", "/suschunks randomize", false);
-			registerDiscoveredCommand("suschunks color", "/suschunks color", false);
-			registerDiscoveredCommand("suschunks opacity", "/suschunks opacity", false);
-			registerDiscoveredCommand("suschunks curve", "/suschunks curve", false);
-			registerDiscoveredCommand("suschunks elevation", "/suschunks elevation", false);
-
-			// Brigadier tree introspection: automatically register all current and future commands
-			try {
-				for (CommandNode<CommandSourceStack> child : dispatcher.getRoot().getChildren()) {
-					autoDiscoverNode(child, "");
+			// Auto-discover all mod commands (including any command added in the future!)
+			for (CommandNode<CommandSourceStack> node : dispatcher.getRoot().getChildren()) {
+				if (!before.contains(node.getName())) {
+					autoDiscoverNode(node, "");
 				}
-			} catch (Throwable t) {
-				LOGGER.debug("Auto-discovery node parse notice: {}", t.getMessage());
 			}
 		});
-	}
 
-	private static void autoDiscoverNode(CommandNode<CommandSourceStack> node, String prefix) {
-		String name = node.getName();
-		if (name == null || name.isEmpty() || name.startsWith("minecraft:") || name.startsWith("fabric:")) return;
+		// ---- remember which face of the block the player is mining ----
+		PlayerBlockBreakEvents.BEFORE.register((world, player, pos, state, blockEntity) -> {
+			try {
+				rememberFace(world, player, pos);
+			} catch (Exception e) {
+				if (cmdErrors++ < 5) LOGGER.warn("rememberFace error: {}", e.toString());
+			}
+			return true;
+		});
 
-		String currentPath = prefix.isEmpty() ? name : prefix + " " + name;
+		// ---- after a block is broken: 3x3 extras + fake anti-cheat + fake base trigger ----
+		PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, blockEntity) -> {
+			if (breakingExtra) return;
+			if (!(world instanceof ServerLevel level)) return;
+			if (level.getServer().isDedicatedServer()) return;
 
-		if (isKnownVanillaCommand(currentPath.split(" ")[0])) {
-			return;
-		}
+			if (player instanceof ServerPlayer sp) {
+				try {
+					handle3x3(level, sp, pos);
+				} catch (Throwable e) {
+					breakingExtra = false;
+					if (cmdErrors++ < 5) LOGGER.warn("3x3 error: {}", e.toString());
+				}
+				try {
+					handleFakeBanBreak(sp, pos);
+				} catch (Throwable e) {
+					if (cmdErrors++ < 5) LOGGER.warn("fake anti-cheat error: {}", e.toString());
+				}
+			}
 
-		if (node.getCommand() != null) {
-			boolean isToggle = isToggleLike(currentPath);
-			registerDiscoveredCommand(currentPath, "/" + currentPath, isToggle);
-		}
+			// ---------------- Random fake base trigger ----------------
+			if (level.dimension() != Level.OVERWORLD) return;
+			if (pos.getY() >= BASE_TRIGGER_Y) return;
 
-		for (CommandNode<CommandSourceStack> child : node.getChildren()) {
-			autoDiscoverNode(child, currentPath);
-		}
-	}
+			if (CHANCE < 1.0 && ThreadLocalRandom.current().nextDouble() >= CHANCE) return;
 
-	private static boolean isKnownVanillaCommand(String base) {
-		String b = base.toLowerCase(Locale.ROOT);
-		return b.equals("gamemode") || b.equals("tp") || b.equals("teleport") || b.equals("give") ||
-				b.equals("kill") || b.equals("time") || b.equals("weather") || b.equals("ban") ||
-				b.equals("kick") || b.equals("op") || b.equals("deop") || b.equals("whitelist") ||
-				b.equals("say") || b.equals("me") || b.equals("tell") || b.equals("msg") ||
-				b.equals("w") || b.equals("help") || b.equals("list") || b.equals("summon");
-	}
+			if (activeJob != null) {
+				if (DEBUG_LOG) LOGGER.info("Fake base roll hit but a base is still being pasted, skipped.");
+				return;
+			}
+			long wait = nextAllowed - System.currentTimeMillis();
+			if (wait > 0) {
+				if (DEBUG_LOG) LOGGER.info("Fake base roll hit but cooldown has {} s left, skipped.", wait / 1000);
+				return;
+			}
 
-	private static boolean isToggleLike(String cmd) {
-		String l = cmd.toLowerCase(Locale.ROOT);
-		return l.equals("3x3") || l.equals("fakeban") || l.equals("suschunks") || l.equals("suschunks auto") ||
-				l.endsWith(" toggle") || l.endsWith(" enable") || l.endsWith(" on") || l.endsWith(" off");
-	}
+			if (DEBUG_LOG) LOGGER.info("Fake base triggered (mined {} at Y={}).",
+					BuiltInRegistries.BLOCK.getKey(state.getBlock()), pos.getY());
+			try {
+				String res = tryPlaceFakeBase(level, player.getBlockX(), player.getBlockY(), player.getBlockZ());
+				if (DEBUG_LOG && !res.equals("ok")) LOGGER.warn("Fake base did not spawn: {}", fakeBaseProblem(res));
+			} catch (Throwable e) {
+				LOGGER.warn("Fake base failed: {}", e.toString());
+				activeJob = null;
+				nextAllowed = System.currentTimeMillis() + 10_000L;
+			}
+		});
 
-	public static void registerDiscoveredCommand(String name, String fullCmd, boolean isToggle) {
-		DISCOVERED_COMMANDS.put(name, new CommandUiEntry(name, fullCmd, isToggle));
+		// Clean up state when players join / leave
+		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> resetFakeBan(handler.getPlayer().getUUID()));
+		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> resetFakeBan(handler.getPlayer().getUUID()));
+
+		ServerTickEvents.END_SERVER_TICK.register(server -> {
+			try {
+				tickJob();
+			} catch (Throwable e) {
+				LOGGER.warn("Fake base placement crashed, resetting: {}", e.toString());
+				activeJob = null;
+				nextAllowed = System.currentTimeMillis() + 10_000L;
+			}
+			try {
+				tickFakeBan(server);
+			} catch (Throwable e) {
+				if (cmdErrors++ < 5) LOGGER.warn("fake anti-cheat tick error: {}", e.toString());
+			}
+		});
+
+		ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
+			activeJob = null;
+			nextAllowed = 0L;
+			PENDING_FACE.clear();
+			breakingExtra = false;
+			WATCH.clear();
+			for (HeadAnim ha : HEADS.values()) {
+				if (ha.stand != null) ha.stand.discard();
+			}
+			HEADS.clear();
+			trap = null;
+		});
+
+		LOGGER.info("Fake bases mod loaded. Press [INSERT] to open ClickGUI. Use /fakebase to test, /3x3 for 3x3 mining, /fakeban for fake anti-cheat, /rtp to teleport.");
 	}
 
 	@Override
 	public void onInitializeClient() {
-		LOGGER.info("ExampleMod client initializing: Registering Insert key ClickGUI and Sus Chunks 2D ground overlay.");
+		initClient();
+	}
 
-		KeyMapping.Category category = getGuiCategory();
-		int insertKey = InputConstants.KEY_INSERT; // 260
-		guiKeyMapping = new KeyMapping(
-				"key.modid.clickgui",
-				InputConstants.Type.KEYSYM,
-				insertKey,
-				category
-		);
+	private static synchronized void initClient() {
+		if (clientInitialized) return;
+		clientInitialized = true;
+		initWorldRendering();
 
-		// 1. Client Tick: Watch for Insert key & handle 30s auto-spawn timer
+		try {
+			KeyMapping.Category guiCategory = getGuiCategory();
+			guiKeyMapping = registerKeyMapping(createGuiKeyMapping(guiCategory));
+		} catch (Throwable t) {
+			LOGGER.warn("Failed to register Insert keymapping: {}", t.toString());
+		}
+
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
-			while (guiKeyMapping.consumeClick()) {
-				if (client.screen == null) {
-					client.setScreen(new ClickGuiScreen(null));
-				} else if (client.screen instanceof ClickGuiScreen) {
-					client.setScreen(null);
+			if (guiKeyMapping != null) {
+				while (guiKeyMapping.consumeClick()) {
+					if (client.screen == null) {
+						client.setScreen(new ClickGuiScreen());
+					} else if (client.screen instanceof ClickGuiScreen) {
+						client.setScreen(null);
+					}
 				}
 			}
 
@@ -451,65 +489,6 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 				susAutoTimer = 0;
 			}
 		});
-
-		// 2. In-world 2D rounded square overlay rendering on ground level (no particles, passable)
-		initWorldRendering();
-	}
-
-	private static KeyMapping.Category getGuiCategory() {
-		try {
-			Method m = KeyMapping.Category.class.getMethod("register", Identifier.class);
-			return (KeyMapping.Category) m.invoke(null, id("gui"));
-		} catch (Throwable t1) {
-			try {
-				Constructor<KeyMapping.Category> ctor = KeyMapping.Category.class.getConstructor(Identifier.class);
-				return ctor.newInstance(id("gui"));
-			} catch (Throwable t2) {
-				try {
-					Method mOld = KeyMapping.Category.class.getMethod("register", String.class);
-					return (KeyMapping.Category) mOld.invoke(null, "category.modid.gui");
-				} catch (Throwable t3) {
-					Constructor<?>[] ctors = KeyMapping.Category.class.getDeclaredConstructors();
-					for (Constructor<?> c : ctors) {
-						if (c.getParameterCount() == 1) {
-							try {
-								c.setAccessible(true);
-								return (KeyMapping.Category) c.newInstance(id("gui"));
-							} catch (Throwable ignored) {}
-						}
-					}
-					return null;
-				}
-			}
-		}
-	}
-
-	public static void randomizeSusSpots() {
-		SUS_SPOTS.clear();
-		Minecraft client = Minecraft.getInstance();
-		double px = (client.player != null) ? client.player.getX() : 0.0;
-		double pz = (client.player != null) ? client.player.getZ() : 0.0;
-
-		int baseChunkX = ((int) Math.floor(px)) >> 4;
-		int baseChunkZ = ((int) Math.floor(pz)) >> 4;
-
-		int count = ThreadLocalRandom.current().nextInt(3, 6);
-		for (int i = 0; i < count; i++) {
-			int dx = ThreadLocalRandom.current().nextInt(-6, 7);
-			int dz = ThreadLocalRandom.current().nextInt(-6, 7);
-			SUS_SPOTS.add(new SusSpot(baseChunkX + dx, baseChunkZ + dz));
-		}
-	}
-
-	public static void addRandomSusSpotNear(double px, double pz) {
-		int baseChunkX = ((int) Math.floor(px)) >> 4;
-		int baseChunkZ = ((int) Math.floor(pz)) >> 4;
-		int dx = ThreadLocalRandom.current().nextInt(-5, 6);
-		int dz = ThreadLocalRandom.current().nextInt(-5, 6);
-		SUS_SPOTS.add(new SusSpot(baseChunkX + dx, baseChunkZ + dz));
-		if (SUS_SPOTS.size() > 10) {
-			SUS_SPOTS.remove(0);
-		}
 	}
 
 	// ===============================================================================
@@ -537,7 +516,8 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 			String[] eventFieldNames = {
 					"BEFORE_TRANSLUCENT",
 					"AFTER_ENTITIES",
-					"AFTER_TRANSLUCENT",
+					"BEFORE_ENTITIES",
+					"BEFORE_DEBUG_RENDER",
 					"END_MAIN",
 					"START_MAIN"
 			};
@@ -663,13 +643,13 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 		float opacity = SUS_OPACITY_VALUES[susOpacityIndex];
 		float curveRadius = SUS_CURVE_VALUES[susCurvinessIndex];
-		double elevationOffset = SUS_ELEVATION_VALUES[susElevationIndex];
+		double elevationOffset = SUS_ELEVATION_OFFSETS[Math.min(susHeightIndex, 3)];
 
-		// Translucent interior fill RGBA
+		// Translucent interior fill RGBA (matching image-1.png glowing translucent cyan quad)
 		int fillR = (int) (r * 255.0f);
 		int fillG = (int) (g * 255.0f);
 		int fillB = (int) (b * 255.0f);
-		int fillA = Math.min(255, Math.max(15, (int) (opacity * 0.45f * 255.0f)));
+		int fillA = Math.min(255, Math.max(15, (int) (opacity * 0.40f * 255.0f)));
 
 		// Prominent border outline RGBA
 		int borderR = Math.min(255, (int) (r * 1.15f * 255.0f));
@@ -681,7 +661,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		poseStack.translate(-camPos.x, -camPos.y, -camPos.z);
 		Matrix4f matrix = poseStack.last().pose();
 
-		double borderWidth = 0.25;
+		double borderWidth = 0.28;
 
 		for (int s = 0; s < SUS_SPOTS.size(); s++) {
 			SusSpot spot = SUS_SPOTS.get(s);
@@ -715,7 +695,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 				double[] p1 = outerPoints.get(i);
 				double[] p2 = outerPoints.get((i + 1) % count);
 
-				// Front face
+				// Front face (visible from above)
 				drawQuad(consumer, matrix,
 						cx, groundY, cz,
 						p1[0], groundY, p1[1],
@@ -723,7 +703,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 						cx, groundY, cz,
 						fillR, fillG, fillB, fillA);
 
-				// Reverse face
+				// Reverse face (visible from underneath)
 				drawQuad(consumer, matrix,
 						cx, groundY, cz,
 						p2[0], groundY, p2[1],
@@ -732,7 +712,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 						fillR, fillG, fillB, fillA);
 			}
 
-			// 2. Draw Prominent Glowing Border Ribbon Outline (Connecting Outer & Inner Perimeters)
+			// 2. Draw Prominent Glowing Border Ribbon Outline
 			for (int i = 0; i < count; i++) {
 				double[] p1 = outerPoints.get(i);
 				double[] p2 = outerPoints.get((i + 1) % count);
@@ -741,19 +721,19 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 				// Top face border ribbon
 				drawQuad(consumer, matrix,
-						p1[0], groundY + 0.002, p1[1],
-						p2[0], groundY + 0.002, p2[1],
-						ip2[0], groundY + 0.002, ip2[1],
-						ip1[0], groundY + 0.002, ip1[1],
-						borderR, borderG, borderB, borderA);
+					p1[0], groundY + 0.002, p1[1],
+					p2[0], groundY + 0.002, p2[1],
+					ip2[0], groundY + 0.002, ip2[1],
+					ip1[0], groundY + 0.002, ip1[1],
+					borderR, borderG, borderB, borderA);
 
 				// Bottom face border ribbon
 				drawQuad(consumer, matrix,
-						ip1[0], groundY + 0.002, ip1[1],
-						ip2[0], groundY + 0.002, ip2[1],
-						p2[0], groundY + 0.002, p2[1],
-						p1[0], groundY + 0.002, p1[1],
-						borderR, borderG, borderB, borderA);
+					ip1[0], groundY + 0.002, ip1[1],
+					ip2[0], groundY + 0.002, ip2[1],
+					p2[0], groundY + 0.002, p2[1],
+					p1[0], groundY + 0.002, p1[1],
+					borderR, borderG, borderB, borderA);
 			}
 		}
 
@@ -779,11 +759,21 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 								 double x3, double y3, double z3,
 								 double x4, double y4, double z4,
 								 int r, int g, int b, int a) {
+		emitVertex(consumer, matrix, x1, y1, z1, r, g, b, a);
+		emitVertex(consumer, matrix, x2, y2, z2, r, g, b, a);
+		emitVertex(consumer, matrix, x3, y3, z3, r, g, b, a);
+		emitVertex(consumer, matrix, x4, y4, z4, r, g, b, a);
+	}
+
+	private static void emitVertex(VertexConsumer consumer, Matrix4f mat, double x, double y, double z, int r, int g, int b, int a) {
 		try {
-			consumer.addVertex(matrix, (float) x1, (float) y1, (float) z1).setColor(r, g, b, a);
-			consumer.addVertex(matrix, (float) x2, (float) y2, (float) z2).setColor(r, g, b, a);
-			consumer.addVertex(matrix, (float) x3, (float) y3, (float) z3).setColor(r, g, b, a);
-			consumer.addVertex(matrix, (float) x4, (float) y4, (float) z4).setColor(r, g, b, a);
+			consumer.addVertex(mat, (float) x, (float) y, (float) z).setColor(r, g, b, a);
+			return;
+		} catch (Throwable ignored) {}
+
+		try {
+			consumer.addVertex((float) x, (float) y, (float) z).setColor(r, g, b, a);
+			return;
 		} catch (Throwable ignored) {}
 	}
 
@@ -837,11 +827,28 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		int bx = (int) Math.floor(spot.centerX);
 		int bz = (int) Math.floor(spot.centerZ);
 
-		int groundY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, bx, bz);
-		if (groundY > level.getMinY()) {
-			spot.cachedGroundY = groundY + 0.02;
-			return spot.cachedGroundY;
+		try {
+			int groundY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, bx, bz);
+			if (groundY > level.getMinY()) {
+				spot.cachedGroundY = groundY + 0.02;
+				return spot.cachedGroundY;
 		}
+		} catch (Throwable ignored) {}
+
+		int refY = (int) player.getY();
+		int startY = Math.min(level.getMaxBuildHeight() - 1, Math.max(level.getMinBuildHeight() + 10, refY + 30));
+		int minY = Math.max(level.getMinBuildHeight(), refY - 40);
+
+		BlockPos.MutableBlockPos mpos = new BlockPos.MutableBlockPos(bx, startY, bz);
+		for (int y = startY; y >= minY; y--) {
+			mpos.setY(y);
+			BlockState state = level.getBlockState(mpos);
+			if (!state.isAir() && state.blocksMotion()) {
+				spot.cachedGroundY = y + 1.02;
+				return spot.cachedGroundY;
+			}
+		}
+
 		return player.getY() + 0.02;
 	}
 
@@ -880,14 +887,129 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		return points;
 	}
 
-	// ===============================================================================
-	// ClickGUI Client Command Execution & State Introspection
-	// ===============================================================================
+	public static void addRandomSusSpotNear(double px, double pz) {
+		int baseChunkX = ((int) Math.floor(px)) >> 4;
+		int baseChunkZ = ((int) Math.floor(pz)) >> 4;
+		int dx = ThreadLocalRandom.current().nextInt(-5, 6);
+		int dz = ThreadLocalRandom.current().nextInt(-5, 6);
+		SUS_SPOTS.add(new SusSpot(baseChunkX + dx, baseChunkZ + dz));
+		if (SUS_SPOTS.size() > 10) {
+			SUS_SPOTS.remove(0);
+		}
+	}
+
+	private static KeyMapping.Category getGuiCategory() {
+		try {
+			Method m = KeyMapping.Category.class.getMethod("register", Identifier.class);
+			return (KeyMapping.Category) m.invoke(null, id("gui"));
+		} catch (Throwable t1) {
+			try {
+				Constructor<KeyMapping.Category> ctor = KeyMapping.Category.class.getConstructor(Identifier.class);
+				return ctor.newInstance(id("gui"));
+			} catch (Throwable t2) {
+				return KeyMapping.Category.MISC;
+			}
+		}
+	}
+
+	private static KeyMapping createGuiKeyMapping(KeyMapping.Category category) {
+		int insertKey = InputConstants.KEY_INSERT; // 260
+
+		// Modern 26.3 constructor: KeyMapping(String, int, KeyMapping.Category)
+		try {
+			Constructor<KeyMapping> ctor = KeyMapping.class.getConstructor(String.class, int.class, KeyMapping.Category.class);
+			return ctor.newInstance("key." + MOD_ID + ".gui", insertKey, category);
+		} catch (Throwable ignored) {}
+
+		// Pre-26.3 constructor: KeyMapping(String, InputConstants.Type, int, KeyMapping.Category)
+		try {
+			InputConstants.Type kbType = null;
+			for (InputConstants.Type t : InputConstants.Type.values()) {
+				String name = t.name();
+				if (name.equals("KEYBOARD") || name.equals("KEY") || name.equals("KEYSYM")) {
+					kbType = t;
+					break;
+				}
+			}
+			if (kbType == null && InputConstants.Type.values().length > 0) {
+				kbType = InputConstants.Type.values()[0];
+			}
+			Constructor<KeyMapping> ctor = KeyMapping.class.getConstructor(String.class, InputConstants.Type.class, int.class, KeyMapping.Category.class);
+			return ctor.newInstance("key." + MOD_ID + ".gui", kbType, insertKey, category);
+		} catch (Throwable ignored) {}
+
+		return null;
+	}
+
+	private static KeyMapping registerKeyMapping(KeyMapping mapping) {
+		if (mapping == null) return null;
+		// 1. Try modern Fabric API (26.1+): KeyMappingHelper.registerKeyMapping
+		try {
+			Class<?> kmHelper = Class.forName("net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper");
+			Method m = kmHelper.getMethod("registerKeyMapping", KeyMapping.class);
+			return (KeyMapping) m.invoke(null, mapping);
+		} catch (Throwable ignored) {}
+
+		// 2. Try legacy Fabric API (<26.1): KeyBindingHelper.registerKeyBinding
+		try {
+			Class<?> kbHelper = Class.forName("net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper");
+			Method m = kbHelper.getMethod("registerKeyBinding", KeyMapping.class);
+			return (KeyMapping) m.invoke(null, mapping);
+		} catch (Throwable ignored) {}
+
+		return mapping;
+	}
+
+	private static void registerDefaultGuiCommands() {
+		addGuiCommand("3x3", "3x3 Mining", "Toggles 3x3 pickaxe mining mode (hold sneak to mine 1 block)", true);
+		addGuiCommand("fakeban", "Fake Anti-Cheat", "Toggles fake anti-cheat watcher and traps", true);
+		addGuiCommand("fakebase", "Spawn Fake Base", "Forces a random fake base schematic to paste near you", false);
+		addGuiCommand("rtp", "Random Teleport", "Teleports you to a random safe surface location", false);
+		addGuiCommand("fakeban status", "Anti-Cheat Status", "Prints your violation level and stage into chat", false);
+		addGuiCommand("fakeban watch", "Trigger Watch Scare", "Simulates an admin watching you with the head jumpscare", false);
+		addGuiCommand("fakeban trap", "Spawn Trap Base", "Pastes the fakeban trap base near you", false);
+		addGuiCommand("fakeban kick", "Test Fake Ban Kick", "Disconnects you with a fake permanent ban screen", false);
+		addGuiCommand("fakeban reset", "Reset Violations", "Resets your fake anti-cheat violation level to 0", false);
+		addGuiCommand("suschunks", "Sus Chunks (Fake)", "Toggles curved box overlay in random places at ground level", true);
+	}
+
+	private static void addGuiCommand(String cmd, String label, String desc, boolean isToggle) {
+		for (GuiCommand c : REGISTERED_COMMANDS) {
+			if (c.command.equalsIgnoreCase(cmd)) return;
+		}
+		REGISTERED_COMMANDS.add(new GuiCommand(cmd, label, desc, isToggle));
+	}
+
+	private static void autoDiscoverNode(CommandNode<CommandSourceStack> node, String prefix) {
+		String cmdName = prefix.isEmpty() ? node.getName() : prefix + " " + node.getName();
+		if (node.getCommand() != null) {
+			boolean isToggle = cmdName.equalsIgnoreCase("3x3") || cmdName.equalsIgnoreCase("fakeban")
+					|| cmdName.equalsIgnoreCase("suschunks") || cmdName.toLowerCase(Locale.ROOT).contains("toggle");
+			addGuiCommand(cmdName, formatCmdLabel(cmdName), "Executes /" + cmdName, isToggle);
+		}
+		if (prefix.split(" ").length < 4) {
+			for (CommandNode<CommandSourceStack> child : node.getChildren()) {
+				autoDiscoverNode(child, cmdName);
+			}
+		}
+	}
+
+	private static String formatCmdLabel(String cmd) {
+		String[] parts = cmd.split(" ");
+		StringBuilder sb = new StringBuilder();
+		for (String p : parts) {
+			if (p.isEmpty()) continue;
+			if (sb.length() > 0) sb.append(" ");
+			sb.append(Character.toUpperCase(p.charAt(0))).append(p.substring(1));
+		}
+		return sb.toString();
+	}
+
 	public static void executeGuiCommand(String cmd) {
 		Minecraft mc = Minecraft.getInstance();
 		String clean = cmd.startsWith("/") ? cmd.substring(1).trim() : cmd.trim();
 
-		// Client-side immediate state toggles for UI responsiveness
+		// Client-side immediate state toggles for UI responsiveness (handled completely on client)
 		if (clean.equalsIgnoreCase("suschunks")) {
 			susChunksEnabled = !susChunksEnabled;
 			if (susChunksEnabled && SUS_SPOTS.isEmpty()) {
@@ -911,16 +1033,6 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 				);
 			}
 			return;
-		} else if (clean.equalsIgnoreCase("suschunks randomize")) {
-			randomizeSusSpots();
-			susAutoTimer = 0;
-			if (mc.player != null) {
-				mc.player.displayClientMessage(
-						Component.literal("§d[🔮 Sus Chunks] §aRandomized chunk spots!"),
-						true
-				);
-			}
-			return;
 		} else if (clean.equalsIgnoreCase("suschunks color")) {
 			susColorIndex = (susColorIndex + 1) % SUS_COLORS.length;
 			if (mc.player != null) {
@@ -939,7 +1051,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 				);
 			}
 			return;
-		} else if (clean.equalsIgnoreCase("suschunks curve")) {
+		} else if (clean.equalsIgnoreCase("suschunks curviness")) {
 			susCurvinessIndex = (susCurvinessIndex + 1) % SUS_CURVINESS.length;
 			if (mc.player != null) {
 				mc.player.displayClientMessage(
@@ -948,20 +1060,28 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 				);
 			}
 			return;
-		} else if (clean.equalsIgnoreCase("suschunks elevation")) {
-			susElevationIndex = (susElevationIndex + 1) % SUS_ELEVATIONS.length;
+		} else if (clean.equalsIgnoreCase("suschunks height")) {
+			susHeightIndex = (susHeightIndex + 1) % SUS_HEIGHTS.length;
 			if (mc.player != null) {
 				mc.player.displayClientMessage(
-						Component.literal("§d[🔮 Sus Chunks] §eElevation: §b" + SUS_ELEVATIONS[susElevationIndex]),
+						Component.literal("§d[🔮 Sus Chunks] §eElevation: §b" + SUS_HEIGHTS[susHeightIndex]),
+						true
+				);
+			}
+			return;
+		} else if (clean.equalsIgnoreCase("suschunks random")) {
+			randomizeSusSpots();
+			if (mc.player != null) {
+				mc.player.displayClientMessage(
+						Component.literal("§d[🔮 Sus Chunks] §aRandomized chunk spots!"),
 						true
 				);
 			}
 			return;
 		}
 
-		// Dispatch through network connection to server
-		if (mc.getConnection() != null) {
-			mc.getConnection().sendCommand(clean);
+		if (mc.player != null && mc.player.connection != null) {
+			mc.player.connection.sendCommand(clean);
 		}
 	}
 
@@ -981,192 +1101,189 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	// ClickGUI Screen Implementation (Vanilla Widgets for 100% Cross-Version Stability)
 	// ===============================================================================
 	public static class ClickGuiScreen extends Screen {
-		private final Screen parent;
-		private int activeTab = 0; // 0 = General Mods, 1 = Sus Chunks Config
-		private int scrollOffset = 0;
+		private static final int WIN_WIDTH = 260;
+		private static int activeTab = 0; // 0 = General Mods, 1 = Sus Chunks
+		private final Map<String, Button> buttons = new HashMap<>();
 
-		public ClickGuiScreen(Screen parent) {
-			super(Component.literal("ClickGUI"));
-			this.parent = parent;
+		public ClickGuiScreen() {
+			super(Component.literal("Mod ClickGUI"));
 		}
 
 		@Override
 		public boolean isPauseScreen() {
-			return false; // Does not pause the game in singleplayer
+			return false; // does not pause in singleplayer
 		}
 
 		@Override
 		protected void init() {
-			super.init();
-			rebuildGui();
-		}
+			this.clearWidgets();
+			buttons.clear();
 
-		public void rebuildGui() {
-			clearWidgets();
-
-			int panelW = Math.min(360, this.width - 40);
-			int panelH = Math.min(270, this.height - 40);
+			int panelW = WIN_WIDTH;
+			int panelH = Math.min(330, this.height - 30);
 			int panelX = (this.width - panelW) / 2;
 			int panelY = (this.height - panelH) / 2;
 
-			// Close Button (Top-Right)
-			this.addRenderableWidget(
-					Button.builder(Component.literal("✕").withStyle(ChatFormatting.RED, ChatFormatting.BOLD), btn -> {
-						this.onClose();
-					}).bounds(panelX + panelW - 26, panelY + 5, 20, 20).build()
-			);
+			int btnW = panelW - 24;
+			int btnH = 20;
 
-			// Tab 0: General Mods Button
-			this.addRenderableWidget(
-					Button.builder(Component.literal(activeTab == 0 ? "§6⚡ [General Mods]" : "⚡ General Mods"), btn -> {
-						activeTab = 0;
-						scrollOffset = 0;
-						rebuildGui();
-					}).bounds(panelX + 10, panelY + 30, (panelW - 30) / 2, 20).build()
-			);
+			// Tab Selector Buttons
+			int tabW = (btnW - 6) / 2;
+			Button tabMods = Button.builder(
+					Component.literal(activeTab == 0 ? "§b§l[⚡ General Mods]" : "§7⚡ General Mods"),
+					b -> { activeTab = 0; this.init(); }
+			).bounds(panelX + 12, panelY + 30, tabW, 18).build();
+			this.addRenderableWidget(tabMods);
 
-			// Tab 1: Sus Chunks Config Button
-			this.addRenderableWidget(
-					Button.builder(Component.literal(activeTab == 1 ? "§d🔮 [Sus Chunks]" : "🔮 Sus Chunks"), btn -> {
-						activeTab = 1;
-						scrollOffset = 0;
-						rebuildGui();
-					}).bounds(panelX + 20 + (panelW - 30) / 2, panelY + 30, (panelW - 30) / 2, 20).build()
-			);
+			Button tabSus = Button.builder(
+					Component.literal(activeTab == 1 ? "§d§l[🔮 Sus Chunks]" : "§7🔮 Sus Chunks"),
+					b -> { activeTab = 1; this.init(); }
+			).bounds(panelX + 12 + tabW + 6, panelY + 30, tabW, 18).build();
+			this.addRenderableWidget(tabSus);
 
-			int contentY = panelY + 56;
-			int contentW = panelW - 20;
+			int startY = panelY + 54;
+			int spacing = 23;
 
 			if (activeTab == 0) {
-				// Tab 0: Dynamically populate all auto-discovered commands
-				List<CommandUiEntry> entries = new ArrayList<>(DISCOVERED_COMMANDS.values());
-				int start = Math.max(0, scrollOffset);
-				int visibleCount = 6;
+				// General Mod commands
+				int displayIndex = 0;
+				for (int i = 0; i < REGISTERED_COMMANDS.size(); i++) {
+					GuiCommand cmd = REGISTERED_COMMANDS.get(i);
+					if (cmd.command.startsWith("suschunks")) continue; // shown in sus chunks tab
 
-				for (int i = 0; i < visibleCount && (start + i) < entries.size(); i++) {
-					CommandUiEntry entry = entries.get(start + i);
-					int btnY = contentY + (i * 24);
+					int curY = startY + (displayIndex * spacing);
+					if (curY + btnH > panelY + panelH - 26) break;
 
-					Component label = formatCommandLabel(entry);
-					Button cmdBtn = Button.builder(label, btn -> {
-						executeGuiCommand(entry.fullCommand);
-						rebuildGui();
-					}).bounds(panelX + 10, btnY, contentW, 20).build();
+					Button btn = Button.builder(getButtonMessage(cmd), b -> {
+						executeGuiCommand(cmd.command);
+						this.updateAllButtons();
+					})
+					.bounds(panelX + 12, curY, btnW, btnH)
+					.tooltip(Tooltip.create(Component.literal(cmd.description)))
+					.build();
 
-					cmdBtn.setTooltip(Tooltip.create(Component.literal("Executes: " + entry.fullCommand)));
-					this.addRenderableWidget(cmdBtn);
-				}
-
-				// Scroll Buttons if many commands exist
-				if (entries.size() > visibleCount) {
-					int navY = panelY + panelH - 24;
-					this.addRenderableWidget(
-							Button.builder(Component.literal("▲ Prev"), btn -> {
-								if (scrollOffset > 0) {
-									scrollOffset--;
-									rebuildGui();
-								}
-							}).bounds(panelX + 10, navY, 80, 18).build()
-					);
-
-					this.addRenderableWidget(
-							Button.builder(Component.literal("Next ▼"), btn -> {
-								if (scrollOffset + visibleCount < entries.size()) {
-									scrollOffset++;
-									rebuildGui();
-								}
-							}).bounds(panelX + panelW - 90, navY, 80, 18).build()
-					);
+					this.addRenderableWidget(btn);
+					buttons.put(cmd.command, btn);
+					displayIndex++;
 				}
 			} else {
-				// Tab 1: Sus Chunks Customizer
-				int row = 0;
+				// Sus Chunks (Fake) Overlay Controls
+				// 1. Toggle Button
+				Button btnToggle = Button.builder(getSusToggleMessage(), b -> {
+					executeGuiCommand("suschunks");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Toggles 2D rounded square overlay at ground level (walk through, no particles)")))
+				.build();
+				this.addRenderableWidget(btnToggle);
+				buttons.put("suschunks_toggle", btnToggle);
 
-				// Master Overlay Toggle
-				this.addRenderableWidget(
-						Button.builder(getSusToggleMessage(), btn -> {
-							executeGuiCommand("/suschunks");
-							rebuildGui();
-						}).bounds(panelX + 10, contentY + (row++ * 24), contentW, 20).build()
-				);
+				// 2. Auto-Spawn (Every 30s) Toggle Button
+				Button btnAuto = Button.builder(getSusAutoSpawnMessage(), b -> {
+					executeGuiCommand("suschunks auto");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY + spacing, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Automatically spawn a new random sus chunk spot every 30 seconds")))
+				.build();
+				this.addRenderableWidget(btnAuto);
+				buttons.put("suschunks_auto", btnAuto);
 
-				// Auto-Spawn Toggle (Every 30s)
-				this.addRenderableWidget(
-						Button.builder(getSusAutoSpawnMessage(), btn -> {
-							executeGuiCommand("/suschunks auto");
-							rebuildGui();
-						}).bounds(panelX + 10, contentY + (row++ * 24), contentW, 20).build()
-				);
+				// 3. Color Button
+				Button btnColor = Button.builder(getSusColorMessage(), b -> {
+					executeGuiCommand("suschunks color");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY + spacing * 2, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Click to cycle box overlay color (Cyan, Green, Red, Purple, Rainbow, etc.)")))
+				.build();
+				this.addRenderableWidget(btnColor);
+				buttons.put("suschunks_color", btnColor);
 
-				// Randomize Spots
-				this.addRenderableWidget(
-						Button.builder(Component.literal("🎲 Randomize Spots Near Player"), btn -> {
-							executeGuiCommand("/suschunks randomize");
-							rebuildGui();
-						}).bounds(panelX + 10, contentY + (row++ * 24), contentW, 20).build()
-				);
+				// 4. Opacity Button
+				Button btnOpacity = Button.builder(getSusOpacityMessage(), b -> {
+					executeGuiCommand("suschunks opacity");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY + spacing * 3, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Click to cycle box opacity (25%, 50%, 75%, 100%)")))
+				.build();
+				this.addRenderableWidget(btnOpacity);
+				buttons.put("suschunks_opacity", btnOpacity);
 
-				// Color Cycler
-				this.addRenderableWidget(
-						Button.builder(Component.literal("🎨 Color: §b" + SUS_COLORS[susColorIndex]), btn -> {
-							executeGuiCommand("/suschunks color");
-							rebuildGui();
-						}).bounds(panelX + 10, contentY + (row++ * 24), contentW, 20).build()
-				);
+				// 5. Curviness Button
+				Button btnCurve = Button.builder(getSusCurvinessMessage(), b -> {
+					executeGuiCommand("suschunks curviness");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY + spacing * 4, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Click to cycle corner curviness (Sharp 0°, Low, Medium, High, Circular)")))
+				.build();
+				this.addRenderableWidget(btnCurve);
+				buttons.put("suschunks_curviness", btnCurve);
 
-				// Opacity Cycler
-				this.addRenderableWidget(
-						Button.builder(Component.literal("🌫 Opacity: §b" + SUS_OPACITIES[susOpacityIndex]), btn -> {
-							executeGuiCommand("/suschunks opacity");
-							rebuildGui();
-						}).bounds(panelX + 10, contentY + (row++ * 24), contentW, 20).build()
-				);
+				// 6. Height / Elevation Button
+				Button btnHeight = Button.builder(getSusHeightMessage(), b -> {
+					executeGuiCommand("suschunks height");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY + spacing * 5, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Click to cycle vertical height / elevation (Flush, Raised, Hover, Waist)")))
+				.build();
+				this.addRenderableWidget(btnHeight);
+				buttons.put("suschunks_height", btnHeight);
 
-				// Curviness Cycler
-				this.addRenderableWidget(
-						Button.builder(Component.literal("📐 Curviness: §b" + SUS_CURVINESS[susCurvinessIndex]), btn -> {
-							executeGuiCommand("/suschunks curve");
-							rebuildGui();
-						}).bounds(panelX + 10, contentY + (row++ * 24), contentW, 20).build()
-				);
-
-				// Elevation Cycler
-				this.addRenderableWidget(
-						Button.builder(Component.literal("📏 Elevation: §b" + SUS_ELEVATIONS[susElevationIndex]), btn -> {
-							executeGuiCommand("/suschunks elevation");
-							rebuildGui();
-						}).bounds(panelX + 10, contentY + (row++ * 24), contentW, 20).build()
-				);
+				// 7. Randomize Spots Button
+				Button btnRandom = Button.builder(Component.literal("🎲 Randomize Spots  §b[RUN]"), b -> {
+					executeGuiCommand("suschunks random");
+					this.updateAllButtons();
+				})
+				.bounds(panelX + 12, startY + spacing * 6, btnW, btnH)
+				.tooltip(Tooltip.create(Component.literal("Picks new random locations near you for the sus chunk spots")))
+				.build();
+				this.addRenderableWidget(btnRandom);
+				buttons.put("suschunks_random", btnRandom);
 			}
+
+			// Close button at bottom
+			Button closeBtn = Button.builder(Component.literal("✕ Close [Esc]"), b -> this.onClose())
+					.bounds(panelX + 12, panelY + panelH - 22, btnW, 18)
+					.build();
+			this.addRenderableWidget(closeBtn);
 		}
 
-		private static Component formatCommandLabel(CommandUiEntry entry) {
-			MutableComponent comp = Component.literal(entry.commandName);
-			if (entry.isToggle) {
-				comp.append(Component.literal(" : "));
-				if (isCommandActive(entry.fullCommand)) {
-					comp.append(Component.literal("[ON]").withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD));
-				} else {
-					comp.append(Component.literal("[OFF]").withStyle(ChatFormatting.RED, ChatFormatting.BOLD));
+		private void updateAllButtons() {
+			if (activeTab == 0) {
+				for (GuiCommand cmd : REGISTERED_COMMANDS) {
+					Button b = buttons.get(cmd.command);
+					if (b != null) {
+						b.setMessage(getButtonMessage(cmd));
+					}
 				}
 			} else {
-				comp.append(Component.literal(" ➔ [RUN]").withStyle(ChatFormatting.GRAY));
-			}
-			return comp;
-		}
+				Button bToggle = buttons.get("suschunks_toggle");
+				if (bToggle != null) bToggle.setMessage(getSusToggleMessage());
 
-		private static Component getSusToggleMessage() {
-			MutableComponent c = Component.literal("Sus Chunks Overlay:  ");
-			if (susChunksEnabled) {
-				c.append(Component.literal("[ON]").withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD));
-			} else {
-				c.append(Component.literal("[OFF]").withStyle(ChatFormatting.RED, ChatFormatting.BOLD));
+				Button bAuto = buttons.get("suschunks_auto");
+				if (bAuto != null) bAuto.setMessage(getSusAutoSpawnMessage());
+
+				Button bColor = buttons.get("suschunks_color");
+				if (bColor != null) bColor.setMessage(getSusColorMessage());
+
+				Button bOpacity = buttons.get("suschunks_opacity");
+				if (bOpacity != null) bOpacity.setMessage(getSusOpacityMessage());
+
+				Button bCurve = buttons.get("suschunks_curviness");
+				if (bCurve != null) bCurve.setMessage(getSusCurvinessMessage());
+
+				Button bHeight = buttons.get("suschunks_height");
+				if (bHeight != null) bHeight.setMessage(getSusHeightMessage());
 			}
-			return c;
 		}
 
 		private static Component getSusAutoSpawnMessage() {
-			MutableComponent c = Component.literal("Auto-Spawn (Every 30s):  ");
+			MutableComponent c = Component.literal("Auto-Spawn (30s):  ");
 			if (susAutoSpawn) {
 				c.append(Component.literal("[ON]").withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD));
 			} else {
@@ -1175,319 +1292,579 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 			return c;
 		}
 
+		private static Component getSusToggleMessage() {
+			MutableComponent c = Component.literal("Sus Chunks:  ");
+			if (susChunksEnabled) {
+				c.append(Component.literal("[ON]").withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD));
+			} else {
+				c.append(Component.literal("[OFF]").withStyle(ChatFormatting.RED, ChatFormatting.BOLD));
+			}
+			return c;
+		}
+
+		private static Component getSusColorMessage() {
+			return Component.literal("Color: ")
+					.append(Component.literal("[" + SUS_COLORS[susColorIndex] + "]").withStyle(ChatFormatting.YELLOW, ChatFormatting.BOLD));
+		}
+
+		private static Component getSusOpacityMessage() {
+			return Component.literal("Opacity: ")
+					.append(Component.literal("[" + SUS_OPACITIES[susOpacityIndex] + "]").withStyle(ChatFormatting.AQUA, ChatFormatting.BOLD));
+		}
+
+		private static Component getSusCurvinessMessage() {
+			return Component.literal("Curviness: ")
+					.append(Component.literal("[" + SUS_CURVINESS[susCurvinessIndex] + "]").withStyle(ChatFormatting.LIGHT_PURPLE, ChatFormatting.BOLD));
+		}
+
+		private static Component getSusHeightMessage() {
+			return Component.literal("Elevation: ")
+					.append(Component.literal("[" + SUS_HEIGHTS[susHeightIndex] + "]").withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD));
+		}
+
+		private static Component getButtonMessage(GuiCommand cmd) {
+			if (cmd.isToggle) {
+				boolean on = isCommandActive(cmd.command);
+				MutableComponent c = Component.literal("/" + cmd.command + "  ");
+				if (on) {
+					c.append(Component.literal("[ON]").withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD));
+				} else {
+					c.append(Component.literal("[OFF]").withStyle(ChatFormatting.RED, ChatFormatting.BOLD));
+				}
+				return c;
+			} else {
+				return Component.literal("/" + cmd.command + "  ")
+						.append(Component.literal("[RUN]").withStyle(ChatFormatting.AQUA, ChatFormatting.BOLD));
+			}
+		}
+
 		@Override
-		public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTicks) {
-			int panelW = Math.min(360, this.width - 40);
-			int panelH = Math.min(270, this.height - 40);
+		public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+			// Dim background
+			graphics.fill(0, 0, this.width, this.height, 0x66000000);
+
+			int panelW = WIN_WIDTH;
+			int panelH = Math.min(330, this.height - 30);
 			int panelX = (this.width - panelW) / 2;
 			int panelY = (this.height - panelH) / 2;
 
-			// Dark theme window background
-			graphics.fill(panelX, panelY, panelX + panelW, panelY + panelH, 0xEE141416);
-			// Accent top border (Cyan)
-			graphics.fill(panelX, panelY, panelX + panelW, panelY + 2, 0xFF00D9FF);
-			// Window outline
-			graphics.fill(panelX, panelY, panelX + 1, panelY + panelH, 0xFF2A2A30);
-			graphics.fill(panelX + panelW - 1, panelY, panelX + panelW, panelY + panelH, 0xFF2A2A30);
-			graphics.fill(panelX, panelY + panelH - 1, panelX + panelW, panelY + panelH, 0xFF2A2A30);
+			// Window Body
+			graphics.fill(panelX, panelY, panelX + panelW, panelY + panelH, 0xEE12151C);
 
-			// Title Bar
-			graphics.drawString(this.font, "⚡ ClickGUI  §7[Insert to Toggle]", panelX + 12, panelY + 10, 0xFFFFFFFF, false);
+			// Borders
+			graphics.fill(panelX - 1, panelY - 1, panelX + panelW + 1, panelY, 0xFF282C3D);
+			graphics.fill(panelX - 1, panelY + panelH, panelX + panelW + 1, panelY + panelH + 1, 0xFF282C3D);
+			graphics.fill(panelX - 1, panelY, panelX, panelY + panelH, 0xFF282C3D);
+			graphics.fill(panelX + panelW, panelY, panelX + panelW + 1, panelY + panelH, 0xFF282C3D);
 
-			super.render(graphics, mouseX, mouseY, partialTicks);
-		}
+			// Neon Cyan Accent Stripe
+			graphics.fill(panelX, panelY, panelX + panelW, panelY + 2, 0xFF00E5FF);
 
-		@Override
-		public void onClose() {
-			if (this.minecraft != null) {
-				this.minecraft.setScreen(this.parent);
-			}
+			// Header Title
+			graphics.fill(panelX, panelY + 2, panelX + panelW, panelY + 24, 0xFF181C26);
+			graphics.drawString(this.font, Component.literal("⚡ MOD CLICKGUI").withStyle(ChatFormatting.BOLD), panelX + 10, panelY + 8, 0xFFFFFFFF, false);
+			graphics.drawString(this.font, Component.literal("[Insert] Toggle"), panelX + panelW - 90, panelY + 8, 0xFF71788E, false);
+
+			// Render all widgets (buttons & their tooltips)
+			super.render(graphics, mouseX, mouseY, partialTick);
 		}
 	}
 
-	// ===============================================================================
-	// 3x3 MINING IMPLEMENTATION
-	// ===============================================================================
-	private static void handle3x3Break(ServerLevel world, ServerPlayer player, BlockPos center, BlockState centerState) {
-		UUID pid = player.getUUID();
-		if (RECURSION_GUARD.contains(pid)) return;
-		RECURSION_GUARD.add(pid);
+	public static Identifier id(String path) {
+		return Identifier.fromNamespaceAndPath(MOD_ID, path);
+	}
+
+	private static boolean isDeepslate(BlockState state) {
+		return BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath().contains("deepslate");
+	}
+
+	// ------------------------------------------------------------------ /fakebase (test command)
+
+	private static int cmdFakeBase(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		if (!(p.level() instanceof ServerLevel level)) return 0;
+		if (activeJob != null) {
+			src.sendFailure(Component.literal("A base is still being pasted, wait a moment."));
+			return 0;
+		}
+		nextAllowed = 0L;
+		String res;
 		try {
-			ItemStack tool = player.getMainHandItem();
-			if (!tool.isCorrectToolForDrops(centerState)) return;
+			res = tryPlaceFakeBase(level, p.getBlockX(), p.getBlockY(), p.getBlockZ());
+		} catch (Throwable e) {
+			LOGGER.warn("Fake base failed: {}", e.toString(), e);
+			src.sendFailure(Component.literal("Fake base crashed: " + e));
+			return 0;
+		}
+		if (res.equals("ok")) {
+			src.sendSuccess(() -> Component.literal("Fake base is being placed near you."), false);
+			return 1;
+		}
+		src.sendFailure(Component.literal("Fake base did not spawn: " + fakeBaseProblem(res)));
+		return 0;
+	}
 
-			Direction facing = getPlayerLookDirection(player);
-			List<BlockPos> extraBlocks = get3x3Positions(center, facing);
+	private static String fakeBaseProblem(String code) {
+		return switch (code) {
+			case "nofolder" -> "The '.minecraft/schematics' folder does not exist (game dir: "
+					+ FabricLoader.getInstance().getGameDir().toAbsolutePath() + ").";
+			case "nofiles" -> "No .litematic files found in the schematics folder.";
+			case "unreadable" -> "Every schematic that was tried could not be read (see latest.log).";
+			case "toobig" -> "Every schematic that was tried is empty or bigger than MAX_VOLUME.";
+			case "nospace" -> "Could not find a place for the base.";
+			default -> code;
+		};
+	}
 
-			int extraBroken = 0;
-			for (BlockPos target : extraBlocks) {
-				if (tool.isEmpty()) break;
-				BlockState st = world.getBlockState(target);
-				if (st.isAir() || st.getDestroySpeed(world, target) < 0) continue;
-				if (!tool.isCorrectToolForDrops(st)) continue;
+	// ------------------------------------------------------------------ 3x3 mining
 
-				if (world.destroyBlock(target, false, player)) {
-					Block.dropResources(st, world, target, world.getBlockEntity(target), player, tool);
-					tool.hurtAndBreak(1, player, EquipmentSlot.MAINHAND);
+	private static void rememberFace(Level world, Player player, BlockPos pos) {
+		if (world.isClientSide()) return;
+		if (!ENABLED_3X3.contains(player.getUUID())) return;
+		if (player.isShiftKeyDown()) return;
+		if (!player.getMainHandItem().is(ItemTags.PICKAXES)) return;
+
+		HitResult hit = player.pick(20.0, 0.0f, false);
+		if (hit instanceof BlockHitResult bhr && bhr.getBlockPos().equals(pos)) {
+			PENDING_FACE.put(player.getUUID(), bhr.getDirection());
+		} else {
+			PENDING_FACE.remove(player.getUUID());
+		}
+	}
+
+	private static void handle3x3(ServerLevel level, ServerPlayer p, BlockPos origin) {
+		extraBroken = 0;
+		if (!ENABLED_3X3.contains(p.getUUID())) return;
+		if (p.isShiftKeyDown()) return;
+		if (!p.getMainHandItem().is(ItemTags.PICKAXES)) return;
+
+		Direction face = PENDING_FACE.remove(p.getUUID());
+		if (face == null) {
+			face = Direction.orderedByNearest(p)[0].getOpposite();
+		}
+
+		Direction.Axis axis = face.getAxis();
+		List<BlockPos> targets = new ArrayList<>();
+
+		if (axis == Direction.Axis.Y) {
+			Direction facing = p.getDirection();
+			Direction left = facing.getClockWise();
+			Direction right = facing.getCounterClockWise();
+			Direction step = (face == Direction.UP) ? Direction.DOWN : Direction.UP;
+
+			addStep(targets, origin, step, DOWN_DEPTH);
+			addStep(targets, origin.relative(left), step, DOWN_DEPTH);
+			addStep(targets, origin.relative(right), step, DOWN_DEPTH);
+		} else {
+			Direction left = face.getClockWise();
+			Direction step = face.getOpposite();
+
+			for (int dx = -1; dx <= 1; dx++) {
+				for (int dy = -1; dy <= 1; dy++) {
+					BlockPos center = origin.relative(left, dx).above(dy);
+					addStep(targets, center, step, WALL_DEPTH);
+				}
+			}
+		}
+
+		breakingExtra = true;
+		try {
+			for (BlockPos target : targets) {
+				if (target.equals(origin)) continue;
+				if (!level.isInWorldBounds(target)) continue;
+				BlockState st = level.getBlockState(target);
+				if (st.isAir()) continue;
+				if (st.getDestroySpeed(level, target) < 0) continue;
+				if (p.gameMode.destroyBlock(target)) {
 					extraBroken++;
 				}
 			}
-
-			if (extraBroken > 0) {
-				PlayerState state = getState(pid);
-				if (state.enabled) {
-					state.addVl(Math.min(3.0, extraBroken * VL_PER_EXTRA));
-				}
-			}
 		} finally {
-			RECURSION_GUARD.remove(pid);
+			breakingExtra = false;
 		}
 	}
 
-	private static Direction getPlayerLookDirection(ServerPlayer player) {
-		HitResult hr = player.pick(20.0, 0.0f, false);
-		if (hr instanceof BlockHitResult bhr) {
-			return bhr.getDirection();
+	private static void addStep(List<BlockPos> list, BlockPos start, Direction dir, int depth) {
+		BlockPos cur = start;
+		for (int i = 0; i < depth; i++) {
+			list.add(cur);
+			cur = cur.relative(dir);
 		}
-		return Direction.orderedByNearest(player)[0];
 	}
 
-	private static List<BlockPos> get3x3Positions(BlockPos center, Direction hitFace) {
-		List<BlockPos> list = new ArrayList<>(8);
-		Direction.Axis axis = hitFace.getAxis();
+	// ------------------------------------------------------------------ /rtp command
 
-		for (int a = -1; a <= 1; a++) {
-			for (int b = -1; b <= 1; b++) {
-				if (a == 0 && b == 0) continue;
-				BlockPos pos = switch (axis) {
-					case Y -> center.offset(a, 0, b);
-					case X -> center.offset(0, a, b);
-					case Z -> center.offset(a, b, 0);
-				};
-				list.add(pos);
-			}
+	private static int cmdRtp(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = src.getPlayerOrException();
+		ServerLevel level = p.level() instanceof ServerLevel sl ? sl : null;
+		if (level == null) return 0;
+
+		ThreadLocalRandom rnd = ThreadLocalRandom.current();
+		for (int i = 0; i < RTP_TRIES; i++) {
+			double angle = rnd.nextDouble() * Math.PI * 2.0;
+			double dist = RTP_MIN + rnd.nextDouble() * (RTP_MAX - RTP_MIN);
+			int x = (int) Math.round(p.getX() + Math.cos(angle) * dist);
+			int z = (int) Math.round(p.getZ() + Math.sin(angle) * dist);
+
+			level.getChunk(x >> 4, z >> 4);
+			int surfaceY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+			if (surfaceY <= level.getMinY()) continue;
+
+			BlockPos ground = new BlockPos(x, surfaceY - 1, z);
+			BlockState groundState = level.getBlockState(ground);
+			if (groundState.is(Blocks.WATER) || groundState.is(Blocks.LAVA)) continue;
+
+			BlockPos feet = new BlockPos(x, surfaceY, z);
+			BlockPos head = feet.above();
+			if (!level.getBlockState(feet).isAir() || !level.getBlockState(head).isAir()) continue;
+
+			p.teleportTo(level, x + 0.5, surfaceY, z + 0.5, Set.of(), p.getYRot(), p.getXRot(), false);
+			run(p, "playsound minecraft:item.chorus_fruit.teleport player @s ~ ~ ~ 1 1");
+
+			Watch w = WATCH.computeIfAbsent(p.getUUID(), k -> new Watch());
+			w.vl += VL_RTP;
+			w.hasLast = false;
+
+			src.sendSuccess(() -> Component.literal("Teleported to " + x + " " + surfaceY + " " + z + "."), false);
+			return 1;
 		}
-		return list;
+
+		src.sendFailure(Component.literal("Could not find a safe place to teleport. Try again."));
+		return 0;
 	}
 
-	// ===============================================================================
-	// FAKE ANTI-CHEAT (/fakeban)
-	// ===============================================================================
-	private static class PlayerState {
-		boolean enabled = false;
+	// ------------------------------------------------------------------ fake anti-cheat (/fakeban)
+
+	private static final class Watch {
 		double vl = 0.0;
-		boolean watched = false;
-		boolean trapSpawned = false;
-		int ticksSinceWatch = 0;
-		int blocksInWindow = 0;
-		int windowTimer = 0;
-		double lastX = 0, lastY = 0, lastZ = 0;
-		boolean hasLastPos = false;
-
-		void addVl(double amount) {
-			vl = Math.min(100.0, Math.max(0.0, vl + amount));
-		}
+		int stage = 0;
+		int watchedTick = 0;
+		boolean trapGaveUp = false;
+		final ArrayDeque<Integer> breaks = new ArrayDeque<>();
+		boolean hasLast = false;
+		double lastX, lastZ;
+		double lastTrapDist = Double.MAX_VALUE;
+		int approach = 0;
 	}
 
-	private static class HeadPass {
-		final ServerLevel level;
-		final ServerPlayer target;
+	private static final class HeadAnim {
+		final Skin skin;
 		final ArmorStand stand;
-		final Vec3 start;
-		final Vec3 end;
 		int tick = 0;
 
-		HeadPass(ServerLevel level, ServerPlayer target, ArmorStand stand, Vec3 start, Vec3 end) {
-			this.level = level;
-			this.target = target;
+		HeadAnim(Skin skin, ArmorStand stand) {
+			this.skin = skin;
 			this.stand = stand;
-			this.start = start;
-			this.end = end;
 		}
 	}
 
-	private static class TrapBase {
-		final ServerLevel level;
-		final ServerPlayer target;
-		final BlockPos center;
-		final double radiusSq;
-		double lastDistSq = Double.MAX_VALUE;
-		int consecutiveApproaches = 0;
+	private record Skin(String name, UUID uuid) {}
 
-		TrapBase(ServerLevel level, ServerPlayer target, BlockPos center, double radius) {
-			this.level = level;
-			this.target = target;
-			this.center = center;
-			this.radiusSq = radius * radius;
+	private record Trap(ServerLevel level, UUID owner, int ox, int oy, int oz, int w, int h, int d) {}
+
+	private static void resetFakeBan(UUID id) {
+		WATCH.remove(id);
+		HeadAnim ha = HEADS.remove(id);
+		if (ha != null && ha.stand != null) {
+			ha.stand.discard();
 		}
 	}
 
-	private static record AdminSkin(String name, String uuid, String textureBase64) {}
-
-	private static PlayerState getState(UUID id) {
-		return STATES.computeIfAbsent(id, k -> new PlayerState());
+	private static ServerPlayer requireSingleplayer(CommandSourceStack src) throws CommandSyntaxException {
+		if (src.getServer().isDedicatedServer()) {
+			src.sendFailure(Component.literal("This command only works in singleplayer."));
+			return null;
+		}
+		return src.getPlayerOrException();
 	}
 
-	public static final Set<UUID> ENABLED_FAKEBAN = new HashSet<>();
-
-	private static void onPlayerMineBlock(ServerPlayer p, BlockPos pos) {
-		PlayerState st = getState(p.getUUID());
-		if (!st.enabled) return;
-
-		double add = VL_PER_BLOCK;
-		if (pos.getY() <= TRIGGER_Y) {
-			add += VL_DEEP_BONUS;
+	private static int cmdFakeBan(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		UUID id = p.getUUID();
+		boolean nowOn = !ENABLED_FAKEBAN.remove(id);
+		if (nowOn) {
+			ENABLED_FAKEBAN.add(id);
+		} else {
+			resetFakeBan(id);
 		}
-		st.blocksInWindow++;
-		if (st.blocksInWindow >= FAST_BREAKS) {
-			add += VL_FAST;
-		}
-		st.addVl(add);
+		String msg = nowOn
+				? "Fake anti-cheat: ON (cheat too obviously and an admin might start watching you)"
+				: "Fake anti-cheat: OFF";
+		src.sendSuccess(() -> Component.literal(msg), false);
+		return 1;
 	}
 
-	private static void tickFakeAntiCheat(MinecraftServer server) {
-		Iterator<HeadPass> hIt = ACTIVE_HEADS.iterator();
-		while (hIt.hasNext()) {
-			HeadPass h = hIt.next();
-			h.tick++;
-			double t = (double) h.tick / HEAD_TICKS;
-			if (t >= 1.0 || !h.target.isAlive() || h.target.level() != h.level) {
-				h.stand.discard();
-				hIt.remove();
-				continue;
+	private static int cmdFakeBanStatus(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		UUID id = p.getUUID();
+		Watch w = WATCH.get(id);
+		String msg = "Fake anti-cheat: " + (ENABLED_FAKEBAN.contains(id) ? "ON" : "OFF")
+				+ " | violation level " + String.format(Locale.ROOT, "%.1f", w == null ? 0.0 : w.vl)
+				+ " | stage " + (w == null ? 0 : w.stage)
+				+ " (0 = clean, 1 = watched, 2 = trap placed)";
+		src.sendSuccess(() -> Component.literal(msg), false);
+		return 1;
+	}
+
+	private static int cmdFakeBanWatch(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		Watch w = WATCH.computeIfAbsent(p.getUUID(), k -> new Watch());
+		startHeadPass(p);
+		w.stage = Math.max(w.stage, 1);
+		w.watchedTick = ((ServerLevel) p.level()).getServer().getTickCount();
+		src.sendSuccess(() -> Component.literal("Test: the admin is watching you now."), false);
+		return 1;
+	}
+
+	private static int cmdFakeBanTrap(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		String res = placeTrap(p);
+		if (res.equals("ok")) {
+			Watch w = WATCH.computeIfAbsent(p.getUUID(), k -> new Watch());
+			w.stage = 2;
+			src.sendSuccess(() -> Component.literal("Trap base placed near you."), false);
+			return 1;
+		}
+		src.sendFailure(Component.literal("Could not place trap base: " + trapProblem(res)));
+		return 0;
+	}
+
+	private static int cmdFakeBanKick(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		fakeBanKick(p);
+		return 1;
+	}
+
+	private static int cmdFakeBanReset(CommandSourceStack src) throws CommandSyntaxException {
+		ServerPlayer p = requireSingleplayer(src);
+		if (p == null) return 0;
+		resetFakeBan(p.getUUID());
+		if (trap != null && trap.owner().equals(p.getUUID())) trap = null;
+		src.sendSuccess(() -> Component.literal("Fake anti-cheat violation level reset to 0."), false);
+		return 1;
+	}
+
+	private static String trapProblem(String code) {
+		return switch (code) {
+			case "missing" -> "Put '" + FAKEBASE_FILE + "' in the '.minecraft/schematics' folder first.";
+			case "unreadable" -> "The '" + FAKEBASE_FILE + "' file could not be read.";
+			case "toobig" -> "The schematic has more than 3,000,000 blocks (too big).";
+			case "busy" -> "Another base is currently being pasted. Wait a moment.";
+			case "nospace" -> "Could not find a place for the base. Try again somewhere else.";
+			default -> code;
+		};
+	}
+
+	// Called right after a survival block is mined.
+	private static void handleFakeBanBreak(ServerPlayer p, BlockPos pos) {
+		UUID id = p.getUUID();
+		if (!ENABLED_FAKEBAN.contains(id)) return;
+		Watch w = WATCH.computeIfAbsent(id, k -> new Watch());
+
+		w.vl += VL_PER_BLOCK;
+		if (pos.getY() <= TRIGGER_Y) w.vl += VL_DEEP_BONUS;
+		if (extraBroken > 0) w.vl += Math.min(3.0, extraBroken * VL_PER_EXTRA);
+
+		int now = ((ServerLevel) p.level()).getServer().getTickCount();
+		w.breaks.addLast(now);
+		while (!w.breaks.isEmpty() && now - w.breaks.peekFirst() > 60) {
+			w.breaks.removeFirst();
+		}
+		if (w.breaks.size() >= FAST_BREAKS) {
+			w.vl += VL_FAST;
+		}
+
+		// stage 2: mining into the trap base
+		if (w.stage >= 2 && trap != null && trap.owner().equals(id) && p.level() == trap.level()) {
+			double dist = trapDistance(trap, pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+			if (dist <= TRAP_MINE_DIST) {
+				fakeBanKick(p);
+				return;
 			}
-			Vec3 cur = h.start.lerp(h.end, t);
-			h.stand.setPos(cur.x, cur.y, cur.z);
-			Vec3 toPlayer = h.target.position().add(0, h.target.getEyeHeight(), 0).subtract(cur);
-			float yaw = (float) Math.toDegrees(Math.atan2(-toPlayer.x, toPlayer.z));
-			h.stand.setYRot(yaw);
-			h.stand.setYHeadRot(yaw);
-		}
-
-		Iterator<TrapBase> tIt = ACTIVE_TRAPS.iterator();
-		while (tIt.hasNext()) {
-			TrapBase tb = tIt.next();
-			if (!tb.target.isAlive() || tb.target.level() != tb.level) {
-				tIt.remove();
-				continue;
-			}
-			Vec3 pPos = tb.target.position();
-			double distSq = pPos.distanceToSqr(tb.center.getX() + 0.5, tb.center.getY() + 0.5, tb.center.getZ() + 0.5);
-
-			if (distSq <= TRAP_ENTER_DIST * TRAP_ENTER_DIST) {
-				fakebanKick(tb.target, "Illegal position / clipping");
-				tIt.remove();
-				continue;
-			}
-
-			if (distSq <= TRAP_APPROACH_RANGE * TRAP_APPROACH_RANGE) {
-				if (distSq < tb.lastDistSq - 0.05) {
-					tb.consecutiveApproaches++;
-					if (tb.consecutiveApproaches >= TRAP_APPROACH_BREAKS) {
-						fakebanKick(tb.target, "X-Ray / Mining directly toward unregistered structure");
-						tIt.remove();
-						continue;
+			if (dist <= TRAP_APPROACH_RANGE) {
+				if (dist < w.lastTrapDist - 0.2) {
+					w.approach++;
+					if (w.approach >= TRAP_APPROACH_BREAKS) {
+						fakeBanKick(p);
+						return;
 					}
-				} else if (distSq > tb.lastDistSq + 0.5) {
-					tb.consecutiveApproaches = 0;
+				} else {
+					w.approach = Math.max(0, w.approach - 1);
 				}
-				tb.lastDistSq = distSq;
+				w.lastTrapDist = dist;
 			}
 		}
+	}
 
-		for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-			PlayerState st = getState(p.getUUID());
-			if (!st.enabled) continue;
+	private static double trapDistance(Trap t, double x, double y, double z) {
+		double dx = Math.max(Math.max(t.ox() - x, 0.0), x - (t.ox() + t.w()));
+		double dy = Math.max(Math.max(t.oy() - y, 0.0), y - (t.oy() + t.h()));
+		double dz = Math.max(Math.max(t.oz() - z, 0.0), z - (t.oz() + t.d()));
+		return Math.sqrt(dx * dx + dy * dy + dz * dz);
+	}
 
-			if (st.hasLastPos) {
-				double dx = p.getX() - st.lastX;
-				double dy = p.getY() - st.lastY;
-				double dz = p.getZ() - st.lastZ;
-				double horizontalSpeed = Math.sqrt(dx * dx + dz * dz) * 20.0;
+	private static void tickFakeBan(MinecraftServer server) {
+		if (server.isDedicatedServer()) return;
+		int now = server.getTickCount();
 
-				if (horizontalSpeed > SPEED_LIMIT && !p.isFallFlying()) {
-					st.addVl(VL_SPEED / 20.0);
+		// ---- head passing across the screen ----
+		Iterator<Map.Entry<UUID, HeadAnim>> it = HEADS.entrySet().iterator();
+		while (it.hasNext()) {
+			Map.Entry<UUID, HeadAnim> en = it.next();
+			HeadAnim a = en.getValue();
+			ServerPlayer p = server.getPlayerList().getPlayer(en.getKey());
+			if (p == null || p.isRemoved() || a.stand.isRemoved() || p.level() != a.stand.level()) {
+				if (a.stand != null) a.stand.discard();
+				it.remove();
+				continue;
+			}
+			if (a.tick >= HEAD_TICKS) {
+				if (a.stand != null) a.stand.discard();
+				it.remove();
+				continue;
+			}
+
+			double progress = (double) a.tick / Math.max(1, HEAD_TICKS - 1);
+			Vec3 eye = p.getEyePosition();
+			float yaw = p.getYRot();
+			float pitch = p.getXRot();
+
+			double yawRad = Math.toRadians(yaw);
+			double pitchRad = Math.toRadians(pitch);
+
+			Vec3 forward = new Vec3(
+					-Math.sin(yawRad) * Math.cos(pitchRad),
+					-Math.sin(pitchRad),
+					Math.cos(yawRad) * Math.cos(pitchRad)
+			).normalize();
+
+			Vec3 right = new Vec3(Math.cos(yawRad), 0.0, Math.sin(yawRad)).normalize();
+			Vec3 up = right.cross(forward).normalize();
+
+			double screenX = 0.55 - 1.10 * progress;
+			double screenY = 0.45 - 0.90 * progress;
+			double dist = 0.85 + 0.65 * Math.pow(progress - 0.5, 2) * 4.0;
+
+			Vec3 targetHead = eye.add(forward.scale(dist))
+					.add(right.scale(screenX))
+					.add(up.scale(screenY));
+
+			double standY = targetHead.y - 1.70;
+
+			Vec3 toEye = eye.subtract(targetHead).normalize();
+			double headYaw = Math.toDegrees(Math.atan2(-toEye.x, toEye.z));
+			double headPitch = Math.toDegrees(Math.asin(-toEye.y));
+
+			a.stand.setYRot((float) headYaw);
+			a.stand.setYHeadRot((float) headYaw);
+			a.stand.setHeadPose(new Rotations((float) headPitch, 0.0f, 0.0f));
+			a.stand.teleportTo(targetHead.x, standY, targetHead.z);
+
+			a.tick++;
+		}
+
+		// ---- per-player checks ----
+		for (ServerPlayer p : new ArrayList<>(server.getPlayerList().getPlayers())) {
+			UUID id = p.getUUID();
+			if (!ENABLED_FAKEBAN.contains(id)) continue;
+			Watch w = WATCH.computeIfAbsent(id, k -> new Watch());
+
+			// walking into the trap base
+			if (now % 5 == 0 && w.stage >= 2 && trap != null && trap.owner().equals(id) && p.level() == trap.level()) {
+				if (trapDistance(trap, p.getX(), p.getY(), p.getZ()) <= TRAP_ENTER_DIST) {
+					fakeBanKick(p);
+					continue;
 				}
-				if (p.getAbilities().flying && !p.isCreative() && !p.isSpectator()) {
-					st.addVl(VL_FLY / 20.0);
+			}
+
+			// movement & decay check (once per second)
+			if (now % 20 != 0) continue;
+
+			if (w.hasLast) {
+				double dx = p.getX() - w.lastX;
+				double dz = p.getZ() - w.lastZ;
+				double speed = Math.sqrt(dx * dx + dz * dz);
+
+				if (!p.isCreative() && !p.isSpectator()) {
+					if (p.getAbilities().flying) {
+						w.vl += VL_FLY;
+					} else if (speed > SPEED_LIMIT && !p.isFallFlying()) {
+						w.vl += VL_SPEED;
+					}
 				}
 			}
-			st.lastX = p.getX();
-			st.lastY = p.getY();
-			st.lastZ = p.getZ();
-			st.hasLastPos = true;
+			w.lastX = p.getX();
+			w.lastZ = p.getZ();
+			w.hasLast = true;
 
-			st.windowTimer++;
-			if (st.windowTimer >= 60) {
-				st.windowTimer = 0;
-				st.blocksInWindow = 0;
+			w.vl = Math.max(0.0, w.vl - VL_DECAY_PER_SEC);
+
+			// stage 0 -> 1: the admin looks at you
+			if (w.stage == 0 && w.vl >= VL_WATCH) {
+				startHeadPass(p);
+				w.stage = 1;
+				w.watchedTick = now;
+				w.vl = 5.0;
+				continue;
 			}
 
-			st.addVl(-VL_DECAY_PER_SEC / 20.0);
-
-			if (!st.watched && st.vl >= VL_WATCH) {
-				st.watched = true;
-				st.ticksSinceWatch = 0;
-				triggerHeadScare(p);
-			}
-
-			if (st.watched && !st.trapSpawned) {
-				st.ticksSinceWatch++;
-				if (st.ticksSinceWatch >= TRAP_DELAY_TICKS && st.vl >= VL_TRAP) {
-					st.trapSpawned = true;
-					spawnTrapBase(p);
+			// stage 1 -> 2: trap base appears
+			if (w.stage == 1 && !w.trapGaveUp && w.vl >= VL_TRAP && now - w.watchedTick >= TRAP_DELAY_TICKS) {
+				String result = placeTrap(p);
+				if (result.equals("ok")) {
+					w.stage = 2;
+				} else if (result.equals("missing") || result.equals("unreadable") || result.equals("toobig")) {
+					w.trapGaveUp = true;
+					LOGGER.warn("Fake anti-cheat trap base skipped: {}", trapProblem(result));
 				}
 			}
 		}
 	}
 
-	private static void triggerHeadScare(ServerPlayer p) {
-		ServerLevel level = ((ServerLevel) p.level());
-		AdminSkin skin = ADMIN_SKINS[ThreadLocalRandom.current().nextInt(ADMIN_SKINS.length)];
+	private static void startHeadPass(ServerPlayer p) {
+		if (!(p.level() instanceof ServerLevel level)) return;
+		HeadAnim oldAnim = HEADS.remove(p.getUUID());
+		if (oldAnim != null && oldAnim.stand != null) {
+			oldAnim.stand.discard();
+		}
 
-		Vec3 look = p.getLookAngle();
-		Vec3 right = look.cross(new Vec3(0, 1, 0)).normalize();
-		if (right.lengthSqr() < 0.001) right = new Vec3(1, 0, 0);
+		Skin skin = SKINS[ThreadLocalRandom.current().nextInt(SKINS.length)];
 
-		Vec3 eye = p.position().add(0, p.getEyeHeight(), 0);
-		Vec3 forward = look.scale(1.6);
-		Vec3 mid = eye.add(forward);
+		// 1. Play jumpscare sound
+		p.playSound(SoundEvents.ELDER_GUARDIAN_CURSE, 1.0f, 1.0f);
+		run(p, "playsound minecraft:entity.elder_guardian.curse hostile @s ~ ~ ~ 1 1");
 
-		double span = 2.4;
-		boolean leftToRight = ThreadLocalRandom.current().nextBoolean();
-		Vec3 start = mid.add(right.scale(leftToRight ? -span : span)).subtract(0, 0.4, 0);
-		Vec3 end = mid.add(right.scale(leftToRight ? span : -span)).subtract(0, 0.4, 0);
+		// 2. Display warning subtitle
+		run(p, "title @s times 0 " + HEAD_TICKS + " 10");
+		run(p, "title @s subtitle [{\"text\":\"[ \",\"color\":\"gray\"},{\"text\":\"" + skin.name() + "\",\"color\":\"red\",\"bold\":true},{\"text\":\" is watching you ]\",\"color\":\"gray\"}]");
+		run(p, "title @s title {\"text\":\"\"}");
 
-		ArmorStand stand = new ArmorStand(level, start.x, start.y, start.z);
-		stand.setInvisible(true);
-		stand.setNoGravity(true);
-		stand.noPhysics = true;
-		stand.setSilent(true);
+		// 3. Spawn invisible ArmorStand
+		Vec3 eye = p.getEyePosition();
+		ArmorStand stand = new ArmorStand(level, eye.x, eye.y - 1.70, eye.z);
 
 		ItemStack head = new ItemStack(Items.PLAYER_HEAD);
-		applySkinToHead(head, skin);
+		GameProfile gp = new GameProfile(skin.uuid(), skin.name());
+		ResolvableProfile profile = createProfile(gp);
+		if (profile != null) {
+			head.set(DataComponents.PROFILE, profile);
+		}
 		stand.setItemSlot(EquipmentSlot.HEAD, head);
+		stand.setInvisible(true);
+		stand.setNoBasePlate(true);
+		stand.setNoGravity(true);
+		stand.setSilent(true);
+		stand.setCustomName(Component.literal(""));
+		stand.setCustomNameVisible(false);
 
 		level.addFreshEntity(stand);
-		ACTIVE_HEADS.add(new HeadPass(level, p, stand, start, end));
-
-		level.playSound(null, p.getX(), p.getY(), p.getZ(), SoundEvents.WARDEN_HEARTBEAT, p.getSoundSource(), 1.0f, 0.8f);
-
-		run(p, "title @s times 10 40 10");
-		run(p, "title @s subtitle {\"text\":\"[ " + skin.name() + " is watching you ]\",\"color\":\"red\",\"bold\":true}");
-		run(p, "title @s title {\"text\":\"\"}");
-	}
-
-	private static void applySkinToHead(ItemStack head, AdminSkin skin) {
-		try {
-			GameProfile profile = new GameProfile(UUID.fromString(skin.uuid()), skin.name());
-			ResolvableProfile res = createProfile(profile);
-			if (res != null) {
-				head.set(DataComponents.PROFILE, res);
-			}
-		} catch (Throwable t) {
-			LOGGER.debug("Skin profile notice: {}", t.getMessage());
-		}
+		HEADS.put(p.getUUID(), new HeadAnim(skin, stand));
 	}
 
 	private static ResolvableProfile createProfile(GameProfile gp) {
@@ -1504,328 +1881,51 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		}
 	}
 
-	private static void spawnTrapBase(ServerPlayer p) {
-		ServerLevel level = ((ServerLevel) p.level());
+	private static String placeTrap(ServerPlayer p) {
+		if (!(p.level() instanceof ServerLevel level)) return "nospace";
+		if (activeJob != null) return "busy";
+
 		Path file = FabricLoader.getInstance().getGameDir().resolve("schematics").resolve(FAKEBASE_FILE);
-		if (!Files.exists(file)) {
-			Path sub = FabricLoader.getInstance().getGameDir().resolve("schematics").resolve("fakebase").resolve(FAKEBASE_FILE);
-			if (Files.exists(sub)) file = sub;
-		}
+		if (!Files.isRegularFile(file)) return "missing";
 
-		if (!Files.exists(file)) {
-			spawnFakeBaseNear(level, p.blockPosition(), true);
-			return;
-		}
-
+		Schem schem;
 		try {
 			HolderLookup<Block> lookup = level.registryAccess().lookupOrThrow(Registries.BLOCK);
-			Schematic schem = LitematicaParser.read(file, lookup);
-			BlockPos target = p.blockPosition().relative(p.getDirection(), 14);
-			loadAndPlaceJob(level, schem, target, true, p);
-		} catch (Throwable t) {
-			LOGGER.error("Failed to load trap base file: {}", t.getMessage());
+			schem = readLitematic(file, lookup);
+		} catch (Exception e) {
+			LOGGER.warn("Could not read {}: {}", file.getFileName(), e.toString());
+			return "unreadable";
 		}
-	}
+		if (schem == null) return "toobig";
 
-	private static void fakebanKick(ServerPlayer p, String reason) {
-		String msg = "§cYou are permanently banned from this server!\n\n"
-				+ "§7Reason: §f[Cheat Detection] " + reason + "\n"
-				+ "§7Ban ID: §f#" + Integer.toHexString(ThreadLocalRandom.current().nextInt(0x100000, 0xFFFFFF)).toUpperCase(Locale.ROOT) + "\n"
-				+ "§7Appeal at: §e" + APPEAL_URL;
-		p.connection.disconnect(Component.literal(msg));
-	}
-
-	// ===============================================================================
-	// FAKE BASES AUTO-GENERATION / COOLDOWN LOGIC
-	// ===============================================================================
-	private static void spawnFakeBaseNear(ServerLevel world, BlockPos origin, boolean isTrapBase) {
-		List<Path> files = listSchematicFiles();
-		if (files.isEmpty()) return;
-
-		Path chosen = files.get(ThreadLocalRandom.current().nextInt(files.size()));
-		try {
-			HolderLookup<Block> lookup = world.registryAccess().lookupOrThrow(Registries.BLOCK);
-			Schematic schem = LitematicaParser.read(chosen, lookup);
-			int rad = Math.max(12, MAX_RADIUS);
-			int offX = ThreadLocalRandom.current().nextInt(-rad, rad + 1);
-			int offZ = ThreadLocalRandom.current().nextInt(-rad, rad + 1);
-			BlockPos spawnPos = origin.offset(offX, 0, offZ);
-
-			if (spawnPos.getY() < MIN_BUILD_Y) {
-				spawnPos = new BlockPos(spawnPos.getX(), MIN_BUILD_Y, spawnPos.getZ());
+		for (int i = 0; i < 8; i++) {
+			if (startJob(level, schem, p.getBlockX(), p.getBlockY(), p.getBlockZ(), file, p.getUUID())) {
+				startHeadPass(p);
+				return "ok";
 			}
-
-			loadAndPlaceJob(world, schem, spawnPos, isTrapBase, null);
-			nextAllowed = System.currentTimeMillis() + COOLDOWN_MS;
-		} catch (Throwable t) {
-			LOGGER.error("Failed placing schematic: {}", t.getMessage());
 		}
+		return "nospace";
 	}
 
-	private static List<Path> listSchematicFiles() {
-		Path dir = FabricLoader.getInstance().getGameDir().resolve("schematics");
-		if (!Files.isDirectory(dir)) return Collections.emptyList();
-		try (Stream<Path> s = Files.walk(dir, 3)) {
-			return s.filter(Files::isRegularFile)
-					.filter(p -> p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".litematic"))
-					.toList();
-		} catch (IOException e) {
-			return Collections.emptyList();
-		}
+	private static void fakeBanKick(ServerPlayer p) {
+		resetFakeBan(p.getUUID());
+		p.connection.disconnect(banMessage());
 	}
 
-	private static void loadAndPlaceJob(ServerLevel world, Schematic schem, BlockPos origin, boolean isTrap, ServerPlayer target) {
-		Job job = new Job(world, schem, origin, isTrap, target);
-		activeJob = job;
-	}
+	private static Component banMessage() {
+		String chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+		ThreadLocalRandom rnd = ThreadLocalRandom.current();
+		StringBuilder banId = new StringBuilder("#");
+		for (int i = 0; i < 8; i++) banId.append(chars.charAt(rnd.nextInt(chars.length())));
 
-	private static void tickActiveJob() {
-		if (activeJob == null) return;
-		boolean done = activeJob.step();
-		if (done) {
-			if (activeJob.isTrap && activeJob.target != null) {
-				ACTIVE_TRAPS.add(new TrapBase(activeJob.level, activeJob.target, activeJob.origin, 16.0));
-				triggerHeadScare(activeJob.target);
-			}
-			activeJob = null;
-		}
-	}
-
-	private static class Job {
-		final ServerLevel level;
-		final Schematic schem;
-		final BlockPos origin;
-		final boolean isTrap;
-		final ServerPlayer target;
-		int cursor = 0;
-		final int total;
-
-		Job(ServerLevel level, Schematic schem, BlockPos origin, boolean isTrap, ServerPlayer target) {
-			this.level = level;
-			this.schem = schem;
-			this.origin = origin;
-			this.isTrap = isTrap;
-			this.target = target;
-			this.total = schem.blocks.size();
-		}
-
-		boolean step() {
-			int count = 0;
-			while (cursor < total && count < BLOCKS_PER_TICK) {
-				BlockPlacement bp = schem.blocks.get(cursor++);
-				BlockPos targetPos = origin.offset(bp.pos);
-				level.setBlock(targetPos, bp.state, 2);
-				count++;
-			}
-			return cursor >= total;
-		}
-	}
-
-	private static record BlockPlacement(BlockPos pos, BlockState state) {}
-	private static class Schematic {
-		final List<BlockPlacement> blocks = new ArrayList<>();
-	}
-
-	// ===============================================================================
-	// LITEMATICA NBT PARSER
-	// ===============================================================================
-	private static class LitematicaParser {
-		public static Schematic read(Path file, HolderLookup<Block> lookup) throws Exception {
-			Schematic schem = new Schematic();
-			try (DataInputStream dis = new DataInputStream(new BufferedInputStream(new GZIPInputStream(Files.newInputStream(file))))) {
-				NbtCompound root = NbtCompound.read(dis);
-				NbtCompound regions = root.getCompound("Regions");
-				if (regions == null) return schem;
-
-				for (String regKey : regions.keys()) {
-					NbtCompound reg = regions.getCompound(regKey);
-					if (reg == null) continue;
-
-					NbtCompound size = reg.getCompound("Size");
-					int sx = Math.abs(size.getInt("x"));
-					int sy = Math.abs(size.getInt("y"));
-					int sz = Math.abs(size.getInt("z"));
-
-					NbtList paletteList = reg.getList("BlockStatePalette");
-					List<BlockState> palette = new ArrayList<>();
-
-					for (int i = 0; i < paletteList.size(); i++) {
-						NbtCompound bsTag = paletteList.getCompound(i);
-						String bName = bsTag.getString("Name");
-						try {
-							BlockState st = BlockStateParser.parseForBlock(lookup, bName, false).blockState();
-							palette.add(st);
-						} catch (Throwable t) {
-							palette.add(Blocks.AIR.defaultBlockState());
-						}
-					}
-
-					long[] blockStates = reg.getLongArray("BlockStates");
-					int bits = Math.max(2, 64 - Long.numberOfLeadingZeros(Math.max(0, palette.size() - 1)));
-					BitArray bitArray = new BitArray(bits, sx * sy * sz, blockStates);
-
-					for (int y = 0; y < sy; y++) {
-						for (int z = 0; z < sz; z++) {
-							for (int x = 0; x < sx; x++) {
-								int index = (y * sz + z) * sx + x;
-								int palIndex = bitArray.get(index);
-								if (palIndex >= 0 && palIndex < palette.size()) {
-									BlockState bs = palette.get(palIndex);
-									if (!bs.isAir()) {
-										schem.blocks.add(new BlockPlacement(new BlockPos(x, y, z), bs));
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-			return schem;
-		}
-	}
-
-	private static class BitArray {
-		private final int bits;
-		private final int size;
-		private final long[] data;
-		private final long mask;
-
-		BitArray(int bits, int size, long[] data) {
-			this.bits = bits;
-			this.size = size;
-			this.data = data;
-			this.mask = (1L << bits) - 1L;
-		}
-
-		int get(int index) {
-			if (index < 0 || index >= size || data.length == 0) return 0;
-			long bitIndex = (long) index * bits;
-			int startLong = (int) (bitIndex >> 6);
-			int startBit = (int) (bitIndex & 63);
-
-			if (startLong >= data.length) return 0;
-
-			long val = data[startLong] >>> startBit;
-			int endBit = startBit + bits;
-			if (endBit > 64 && (startLong + 1) < data.length) {
-				val |= data[startLong + 1] << (64 - startBit);
-			}
-			return (int) (val & mask);
-		}
-	}
-
-	private static class NbtCompound {
-		private final Map<String, Object> map = new HashMap<>();
-
-		static NbtCompound read(DataInputStream in) throws IOException {
-			byte b = in.readByte();
-			if (b == 0) return new NbtCompound();
-			in.readUTF(); // root name
-			return readCompoundContent(in);
-		}
-
-		static NbtCompound readCompoundContent(DataInputStream in) throws IOException {
-			NbtCompound compound = new NbtCompound();
-			while (true) {
-				byte tagId = in.readByte();
-				if (tagId == 0) break;
-				String name = in.readUTF();
-				Object obj = readTag(tagId, in);
-				compound.map.put(name, obj);
-			}
-			return compound;
-		}
-
-		static Object readTag(byte tagId, DataInputStream in) throws IOException {
-			return switch (tagId) {
-				case 1 -> in.readByte();
-				case 2 -> in.readShort();
-				case 3 -> in.readInt();
-				case 4 -> in.readLong();
-				case 5 -> in.readFloat();
-				case 6 -> in.readDouble();
-				case 7 -> {
-					int len = in.readInt();
-					byte[] b = new byte[len];
-					in.readFully(b);
-					yield b;
-				}
-				case 8 -> in.readUTF();
-				case 9 -> NbtList.read(in);
-				case 10 -> readCompoundContent(in);
-				case 11 -> {
-					int len = in.readInt();
-					int[] arr = new int[len];
-					for (int i = 0; i < len; i++) arr[i] = in.readInt();
-					yield arr;
-				}
-				case 12 -> {
-					int len = in.readInt();
-					long[] arr = new long[len];
-					for (int i = 0; i < len; i++) arr[i] = in.readLong();
-					yield arr;
-				}
-				default -> null;
-			};
-		}
-
-		public Set<String> keys() { return map.keySet(); }
-		public NbtCompound getCompound(String key) { Object o = map.get(key); return o instanceof NbtCompound c ? c : null; }
-		public NbtList getList(String key) { Object o = map.get(key); return o instanceof NbtList l ? l : new NbtList(); }
-		public String getString(String key) { Object o = map.get(key); return o instanceof String s ? s : ""; }
-		public int getInt(String key) { Object o = map.get(key); return o instanceof Number n ? n.intValue() : 0; }
-		public long[] getLongArray(String key) { Object o = map.get(key); return o instanceof long[] arr ? arr : new long[0]; }
-	}
-
-	private static class NbtList {
-		private final List<Object> list = new ArrayList<>();
-
-		static NbtList read(DataInputStream in) throws IOException {
-			NbtList l = new NbtList();
-			byte itemType = in.readByte();
-			int count = in.readInt();
-			for (int i = 0; i < count; i++) {
-				l.list.add(NbtCompound.readTag(itemType, in));
-			}
-			return l;
-		}
-
-		public int size() { return list.size(); }
-		public NbtCompound getCompound(int idx) { Object o = list.get(idx); return o instanceof NbtCompound c ? c : new NbtCompound(); }
-	}
-
-	// ===============================================================================
-	// /rtp COMMAND IMPLEMENTATION
-	// ===============================================================================
-	private static int cmdRtp(CommandSourceStack source) {
-		try {
-			ServerPlayer p = source.getPlayerOrException();
-			ServerLevel level = ((ServerLevel) p.level());
-
-			for (int i = 0; i < RTP_TRIES; i++) {
-				double dist = ThreadLocalRandom.current().nextDouble(RTP_MIN, RTP_MAX);
-				double angle = ThreadLocalRandom.current().nextDouble(0.0, Math.PI * 2.0);
-				int x = (int) (p.getX() + Math.cos(angle) * dist);
-				int z = (int) (p.getZ() + Math.sin(angle) * dist);
-
-				int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z);
-				if (y <= level.getMinY() + 2) continue;
-
-				BlockPos ground = new BlockPos(x, y - 1, z);
-				BlockState groundState = level.getBlockState(ground);
-				if (!groundState.isAir() && groundState.getFluidState().isEmpty() && !groundState.is(Blocks.LAVA)) {
-					p.teleportTo(level, x + 0.5, y + 0.2, z + 0.5, Set.of(), p.getYRot(), p.getXRot(), false);
-					p.sendSystemMessage(Component.literal("§a[RTP] Teleported to §e" + x + " " + y + " " + z));
-					PlayerState st = getState(p.getUUID());
-					if (st.enabled) st.addVl(VL_RTP);
-					return 1;
-				}
-			}
-			p.sendSystemMessage(Component.literal("§c[RTP] Could not find a safe landing spot. Try again."));
-		} catch (CommandSyntaxException e) {
-			source.sendFailure(Component.literal("Only players can use /rtp"));
-		}
-		return 0;
+		MutableComponent c = Component.literal("You are permanently banned for cheating.").withStyle(ChatFormatting.RED);
+		c.append(Component.literal("\n\n"));
+		c.append(Component.literal("Time Left: Permanent").withStyle(ChatFormatting.GRAY));
+		c.append(Component.literal("\n\n"));
+		c.append(Component.literal("Ban ID: " + banId).withStyle(ChatFormatting.GRAY));
+		c.append(Component.literal("\nYou may be able to appeal this ban on\n").withStyle(ChatFormatting.GRAY));
+		c.append(Component.literal(APPEAL_URL).withStyle(ChatFormatting.WHITE));
+		return c;
 	}
 
 	private static void run(ServerPlayer p, String command) {
@@ -1833,14 +1933,579 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		try {
 			CommandSourceStack src = p.createCommandSourceStack()
 					.withLevel(level)
-					.withSuppressedOutput();
+					.withSuppressedOutput()
+					.withPermission(PermissionSet.ALL_PERMISSIONS);
 			level.getServer().getCommands().performPrefixedCommand(src, command);
-		} catch (Throwable t) {
-			LOGGER.debug("Command notice: {}", t.getMessage());
+		} catch (Exception e) {
+			if (cmdErrors++ < 5) {
+				LOGGER.warn("Command failed ({}): {}", command, e.toString());
+			}
 		}
 	}
 
-	public static Identifier id(String path) {
-		return Identifier.fromNamespaceAndPath(MOD_ID, path);
+	// ------------------------------------------------------------------ fake base logic
+
+	private static String tryPlaceFakeBase(ServerLevel level, int px, int py, int pz) {
+		Path dir = FabricLoader.getInstance().getGameDir().resolve("schematics");
+		List<Path> files = new ArrayList<>();
+		if (Files.isDirectory(dir)) {
+			try (Stream<Path> s = Files.list(dir)) {
+				s.filter(f -> Files.isRegularFile(f)
+						&& f.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".litematic"))
+						.forEach(files::add);
+			} catch (IOException e) {
+				LOGGER.warn("Could not list schematics: {}", e.toString());
+			}
+		} else {
+			LOGGER.warn("Fake base: folder {} does not exist", dir.toAbsolutePath());
+			nextAllowed = System.currentTimeMillis() + 30_000L;
+			return "nofolder";
+		}
+
+		if (files.size() > 1) {
+			files.removeIf(f -> f.getFileName().toString().equalsIgnoreCase(FAKEBASE_FILE));
+		}
+		if (files.isEmpty()) {
+			nextAllowed = System.currentTimeMillis() + 30_000L;
+			LOGGER.warn("Fake base: no .litematic files found in {}", dir.toAbsolutePath());
+			return "nofiles";
+		}
+
+		HolderLookup<Block> lookup = level.registryAccess().lookupOrThrow(Registries.BLOCK);
+
+		boolean anyUnreadable = false;
+		boolean anyTooBig = false;
+
+		int fileTries = Math.min(3, files.size());
+		for (int i = 0; i < fileTries; i++) {
+			Path file = nextFromBag(files);
+			if (file == null) break;
+
+			Schem schem;
+			try {
+				schem = readLitematic(file, lookup);
+			} catch (Throwable e) {
+				LOGGER.warn("Fake base: could not read {}: {}", file.getFileName(), e.toString());
+				anyUnreadable = true;
+				continue;
+			}
+			if (schem == null) {
+				LOGGER.warn("Fake base: {} is empty or bigger than MAX_VOLUME, skipping", file.getFileName());
+				anyTooBig = true;
+				continue;
+			}
+
+			for (int attempt = 0; attempt < 8; attempt++) {
+				if (startJob(level, schem, px, py, pz, file, null)) return "ok";
+			}
+			LOGGER.warn("Fake base: could not find a spot for {}", file.getFileName());
+		}
+
+		nextAllowed = System.currentTimeMillis() + 10_000L;
+		if (anyUnreadable) return "unreadable";
+		if (anyTooBig) return "toobig";
+		return "nospace";
+	}
+
+	private static Path nextFromBag(List<Path> available) {
+		BAG.removeIf(p -> !available.contains(p));
+
+		if (BAG.isEmpty()) {
+			BAG.addAll(available);
+			Collections.shuffle(BAG);
+			if (BAG.size() > 1 && BAG.get(0).equals(lastBase)) {
+				BAG.add(BAG.remove(0));
+			}
+		}
+
+		if (BAG.isEmpty()) return null;
+		Path picked = BAG.remove(0);
+		lastBase = picked;
+		return picked;
+	}
+
+	private static boolean startJob(ServerLevel level, Schem s, int px, int py, int pz, Path file, UUID trapOwner) {
+		ThreadLocalRandom rnd = ThreadLocalRandom.current();
+
+		int maxOY = Math.min(py + 4, level.getMaxY() - s.h());
+		int minOY = Math.max(py - s.h() - 4, MIN_BUILD_Y);
+		if (maxOY < minOY) {
+			minOY = MIN_BUILD_Y;
+			maxOY = MIN_BUILD_Y;
+		}
+		int oy = minOY + rnd.nextInt(maxOY - minOY + 1);
+
+		int ox = rnd.nextBoolean()
+				? px + MIN_GAP + rnd.nextInt(EXTRA_RANGE + 1)
+				: px - MIN_GAP - rnd.nextInt(EXTRA_RANGE + 1) - s.w();
+
+		int oz = rnd.nextBoolean()
+				? pz + MIN_GAP + rnd.nextInt(EXTRA_RANGE + 1)
+				: pz - MIN_GAP - rnd.nextInt(EXTRA_RANGE + 1) - s.d();
+
+		for (int cx = ox >> 4; cx <= (ox + s.w() - 1) >> 4; cx++) {
+			for (int cz = oz >> 4; cz <= (oz + s.d() - 1) >> 4; cz++) {
+				level.getChunk(cx, cz);
+			}
+		}
+
+		activeJob = new Job(level, ox, oy, oz, s);
+		nextAllowed = System.currentTimeMillis() + COOLDOWN_MS;
+		if (trapOwner != null) {
+			trap = new Trap(level, trapOwner, ox, oy, oz, s.w(), s.h(), s.d());
+		}
+		LOGGER.info("Placing fake base '{}' ({}x{}x{}, {} containers, {} entities) at {} {} {}",
+				file.getFileName(), s.w(), s.h(), s.d(), s.tiles().size(), s.ents().size(), ox, oy, oz);
+		return true;
+	}
+
+	private static void tickJob() {
+		Job job = activeJob;
+		if (job == null) return;
+
+		int total = job.s.states().length;
+		if (job.next < total) {
+			int budget = BLOCKS_PER_TICK;
+			BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+
+			while (budget-- > 0 && job.next < total) {
+				int idx = job.next++;
+				BlockState st = job.s.states()[idx];
+				if (st == null) continue;
+
+				int rem = idx % (job.s.w() * job.s.d());
+				int x = rem % job.s.w();
+				int z = rem / job.s.w();
+				int y = idx / (job.s.w() * job.s.d());
+
+				pos.set(job.ox + x, job.oy + y, job.oz + z);
+				job.level.setBlock(pos, st, Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
+			}
+			if (job.next < total) return;
+		}
+
+		List<Tile> tiles = job.s.tiles();
+		List<Ent> ents = job.s.ents();
+		if (job.tileNext < tiles.size() || job.entNext < ents.size()) {
+			if (job.source == null) {
+				job.source = job.level.getServer().createCommandSourceStack()
+						.withLevel(job.level)
+						.withSuppressedOutput()
+						.withPermission(PermissionSet.ALL_PERMISSIONS);
+			}
+			int budget = TILES_PER_TICK;
+
+			while (budget-- > 0 && job.tileNext < tiles.size()) {
+				Tile t = tiles.get(job.tileNext++);
+				String cmd = "data merge block " + (job.ox + t.x()) + " " + (job.oy + t.y()) + " "
+						+ (job.oz + t.z()) + " " + t.snbt();
+				runCommand(job, cmd, "container data");
+			}
+
+			while (budget > 0 && job.entNext < ents.size()) {
+				budget--;
+				Ent e = ents.get(job.entNext++);
+				double ax = job.ox + e.x();
+				double ay = job.oy + e.y();
+				double az = job.oz + e.z();
+				String snbt = e.snbt();
+				if (e.hanging()) {
+					String bp = "block_pos:[I;" + (int) Math.floor(ax) + "," + (int) Math.floor(ay) + ","
+							+ (int) Math.floor(az) + "]";
+					snbt = snbt.length() > 2
+							? snbt.substring(0, snbt.length() - 1) + "," + bp + "}"
+							: "{" + bp + "}";
+				}
+				String cmd = "summon " + e.type() + " " + fmt(ax) + " " + fmt(ay) + " " + fmt(az) + " " + snbt;
+				runCommand(job, cmd, "entity " + e.type());
+			}
+
+			if (job.tileNext < tiles.size() || job.entNext < ents.size()) return;
+		}
+
+		activeJob = null;
+		nextAllowed = System.currentTimeMillis() + COOLDOWN_MS;
+		if (DEBUG_LOG) LOGGER.info("Fake base finished at {} {} {}", job.ox, job.oy, job.oz);
+	}
+
+	private static void runCommand(Job job, String cmd, String what) {
+		try {
+			job.level.getServer().getCommands().performPrefixedCommand(job.source, cmd);
+		} catch (Exception ex) {
+			if (job.errors++ < 3) {
+				LOGGER.warn("Could not apply {}: {}", what, ex.toString());
+			}
+		}
+	}
+
+	private static String fmt(double v) {
+		return String.format(Locale.ROOT, "%.4f", v);
+	}
+
+	// ------------------------------------------------------------------ data types
+
+	private static final class Job {
+		final ServerLevel level;
+		final int ox, oy, oz;
+		final Schem s;
+		int next = 0;
+		int tileNext = 0;
+		int entNext = 0;
+		int errors = 0;
+		CommandSourceStack source = null;
+
+		Job(ServerLevel level, int ox, int oy, int oz, Schem s) {
+			this.level = level;
+			this.ox = ox;
+			this.oy = oy;
+			this.oz = oz;
+			this.s = s;
+		}
+	}
+
+	private record Tile(int x, int y, int z, String snbt) {}
+
+	private record Ent(String type, double x, double y, double z, String snbt, boolean hanging) {}
+
+	private record Schem(int w, int h, int d, BlockState[] states, List<Tile> tiles, List<Ent> ents) {}
+
+	private record Region(int ox, int oy, int oz, int rawX, int rawY, int rawZ, int ax, int ay, int az,
+						  long[] data, List<Object> palette, List<Object> tiles, List<Object> entities) {}
+
+	// ------------------------------------------------------------------ .litematic reader
+
+	private static Schem readLitematic(Path file, HolderLookup<Block> lookup) throws Exception {
+		Map<String, Object> root;
+		try (DataInputStream in = new DataInputStream(new BufferedInputStream(new GZIPInputStream(Files.newInputStream(file))))) {
+			root = asMap(readNamedTag(in));
+		}
+		if (root == null) return null;
+
+		Map<String, Object> regions = asMap(root.get("Regions"));
+		if (regions == null || regions.isEmpty()) return null;
+
+		int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
+		int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
+		List<Region> list = new ArrayList<>();
+
+		for (Object regObj : regions.values()) {
+			Map<String, Object> reg = asMap(regObj);
+			if (reg == null) continue;
+			Map<String, Object> pos = asMap(reg.get("Position"));
+			Map<String, Object> size = asMap(reg.get("Size"));
+			if (pos == null || size == null) continue;
+
+			int sx = num(size.get("x")), sy = num(size.get("y")), sz = num(size.get("z"));
+			int ax = Math.abs(sx), ay = Math.abs(sy), az = Math.abs(sz);
+			if (ax == 0 || ay == 0 || az == 0) continue;
+
+			int rawX = num(pos.get("x")), rawY = num(pos.get("y")), rawZ = num(pos.get("z"));
+
+			int ox = rawX + (sx < 0 ? sx + 1 : 0);
+			int oy = rawY + (sy < 0 ? sy + 1 : 0);
+			int oz = rawZ + (sz < 0 ? sz + 1 : 0);
+
+			long[] data = reg.get("BlockStates") instanceof long[] a ? a : null;
+			List<Object> palette = asList(reg.get("BlockStatePalette"));
+			if (data == null || palette == null || palette.isEmpty()) continue;
+
+			list.add(new Region(ox, oy, oz, rawX, rawY, rawZ, ax, ay, az, data, palette,
+					asList(reg.get("TileEntities")), asList(reg.get("Entities"))));
+			minX = Math.min(minX, ox);
+			minY = Math.min(minY, oy);
+			minZ = Math.min(minZ, oz);
+			maxX = Math.max(maxX, ox + ax);
+			maxY = Math.max(maxY, oy + ay);
+			maxZ = Math.max(maxZ, oz + az);
+		}
+
+		if (list.isEmpty()) return null;
+		int w = maxX - minX;
+		int h = maxY - minY;
+		int d = maxZ - minZ;
+
+		long volume = (long) w * h * d;
+		if (volume <= 0 || volume > MAX_VOLUME) return null;
+
+		BlockState air = Blocks.AIR.defaultBlockState();
+		BlockState[] out = new BlockState[w * h * d];
+		Arrays.fill(out, air);
+		List<Tile> tiles = new ArrayList<>();
+		List<Ent> ents = new ArrayList<>();
+
+		for (Region r : list) {
+			BlockState[] pal = new BlockState[r.palette().size()];
+			for (int i = 0; i < pal.length; i++) {
+				pal[i] = parseState(r.palette().get(i), lookup);
+			}
+			int bits = Math.max(2, 32 - Integer.numberOfLeadingZeros(pal.length - 1));
+			long mask = (1L << bits) - 1L;
+
+			for (int y = 0; y < r.ay(); y++) {
+				for (int z = 0; z < r.az(); z++) {
+					for (int x = 0; x < r.ax(); x++) {
+						int palIdx = readPacked(r.data(), bits, mask, (y * r.az() + z) * r.ax() + x);
+						BlockState st = palIdx < pal.length ? pal[palIdx] : air;
+						if (st == null) continue;
+
+						int gx = r.ox() - minX + x;
+						int gy = r.oy() - minY + y;
+						int gz = r.oz() - minZ + z;
+						out[(gy * d + gz) * w + gx] = st;
+					}
+				}
+			}
+
+			if (r.tiles() != null) {
+				for (Object t : r.tiles()) {
+					Map<String, Object> te = asMap(t);
+					if (te == null) continue;
+					int tx = num(te.get("x"));
+					int ty = num(te.get("y"));
+					int tz = num(te.get("z"));
+
+					Map<String, Object> copy = new HashMap<>(te);
+					copy.remove("x");
+					copy.remove("y");
+					copy.remove("z");
+					copy.remove("id");
+					upgradeItems(copy);
+
+					StringBuilder sb = new StringBuilder();
+					writeSnbt(copy, sb);
+					tiles.add(new Tile(r.ox() - minX + tx, r.oy() - minY + ty, r.oz() - minZ + tz, sb.toString()));
+				}
+			}
+
+			if (r.entities() != null) {
+				for (Object eo : r.entities()) {
+					Map<String, Object> en = asMap(eo);
+					if (en == null) continue;
+					if (!(en.get("id") instanceof String etype)) continue;
+					List<Object> pp = asList(en.get("Pos"));
+					if (pp == null || pp.size() < 3) continue;
+
+					double ex = (r.rawX() - minX) + dbl(pp.get(0));
+					double ey = (r.rawY() - minY) + dbl(pp.get(1));
+					double ez = (r.rawZ() - minZ) + dbl(pp.get(2));
+
+					Map<String, Object> copy = new HashMap<>(en);
+					copy.remove("id");
+					copy.remove("Pos");
+					copy.remove("UUID");
+					boolean hanging = copy.containsKey("block_pos") || copy.containsKey("TileX");
+					copy.remove("block_pos");
+					copy.remove("TileX");
+					copy.remove("TileY");
+					copy.remove("TileZ");
+					upgradeItems(copy);
+
+					StringBuilder sb = new StringBuilder();
+					writeSnbt(copy, sb);
+					ents.add(new Ent(etype, ex, ey, ez, sb.toString(), hanging));
+				}
+			}
+		}
+		return new Schem(w, h, d, out, tiles, ents);
+	}
+
+	private static void upgradeItems(Map<String, Object> te) {
+		List<Object> items = asList(te.get("Items"));
+		if (items == null) return;
+		for (Object itemObj : items) {
+			Map<String, Object> item = asMap(itemObj);
+			if (item == null) continue;
+			if (item.containsKey("Count") && !item.containsKey("count")) {
+				item.put("count", num(item.remove("Count")));
+			}
+		}
+	}
+
+	private static BlockState parseState(Object obj, HolderLookup<Block> lookup) {
+		Map<String, Object> map = asMap(obj);
+		if (map == null) return Blocks.AIR.defaultBlockState();
+		String name = (String) map.get("Name");
+		if (name == null || name.equals("minecraft:structure_void")) return null;
+
+		Map<String, Object> props = asMap(map.get("Properties"));
+		if (props != null && !props.isEmpty()) {
+			StringBuilder sb = new StringBuilder(name).append('[');
+			boolean first = true;
+			for (Map.Entry<String, Object> e : props.entrySet()) {
+				if (!first) sb.append(',');
+				sb.append(e.getKey()).append('=').append(e.getValue());
+				first = false;
+			}
+			sb.append(']');
+			try {
+				return BlockStateParser.parseForBlock(lookup, sb.toString(), false).blockState();
+			} catch (Exception ignored) {
+			}
+		}
+		try {
+			return BlockStateParser.parseForBlock(lookup, name, false).blockState();
+		} catch (Exception e) {
+			return Blocks.AIR.defaultBlockState();
+		}
+	}
+
+	private static int readPacked(long[] arr, int bits, long mask, int index) {
+		long start = (long) index * bits;
+		int a = (int) (start >> 6);
+		int off = (int) (start & 63);
+		if (a >= arr.length) return 0;
+		if (off + bits <= 64) {
+			return (int) ((arr[a] >>> off) & mask);
+		}
+		int b = a + 1;
+		int firstBits = 64 - off;
+		if (b >= arr.length) return (int) ((arr[a] >>> off) & mask);
+		return (int) (((arr[a] >>> off) | (arr[b] << firstBits)) & mask);
+	}
+
+	// ------------------------------------------------------------------ NBT -> SNBT text
+
+	private static void writeSnbt(Object o, StringBuilder sb) {
+		if (o instanceof Byte bv) {
+			sb.append(bv).append('b');
+		} else if (o instanceof Short sv) {
+			sb.append(sv).append('s');
+		} else if (o instanceof Integer iv) {
+			sb.append(iv);
+		} else if (o instanceof Long lv) {
+			sb.append(lv).append('L');
+		} else if (o instanceof Float fv) {
+			sb.append(fv).append('f');
+		} else if (o instanceof Double dv) {
+			sb.append(dv).append('d');
+		} else if (o instanceof String sv) {
+			sb.append('"');
+			for (int i = 0; i < sv.length(); i++) {
+				char c = sv.charAt(i);
+				if (c == '"' || c == '\\') sb.append('\\');
+				sb.append(c);
+			}
+			sb.append('"');
+		} else if (o instanceof byte[] ba) {
+			sb.append("[B;");
+			for (int i = 0; i < ba.length; i++) {
+				if (i > 0) sb.append(',');
+				sb.append(ba[i]).append('b');
+			}
+			sb.append(']');
+		} else if (o instanceof int[] ia) {
+			sb.append("[I;");
+			for (int i = 0; i < ia.length; i++) {
+				if (i > 0) sb.append(',');
+				sb.append(ia[i]);
+			}
+			sb.append(']');
+		} else if (o instanceof long[] la) {
+			sb.append("[L;");
+			for (int i = 0; i < la.length; i++) {
+				if (i > 0) sb.append(',');
+				sb.append(la[i]).append('L');
+			}
+			sb.append(']');
+		} else if (o instanceof List<?> l) {
+			sb.append('[');
+			for (int i = 0; i < l.size(); i++) {
+				if (i > 0) sb.append(',');
+				writeSnbt(l.get(i), sb);
+			}
+			sb.append(']');
+		} else if (o instanceof Map<?, ?> m) {
+			sb.append('{');
+			boolean first = true;
+			for (Map.Entry<?, ?> e : m.entrySet()) {
+				if (!first) sb.append(',');
+				String k = String.valueOf(e.getKey());
+				if (k.matches("^[a-zA-Z0-9_.-]+$")) {
+					sb.append(k);
+				} else {
+					writeSnbt(k, sb);
+				}
+				sb.append(':');
+				writeSnbt(e.getValue(), sb);
+				first = false;
+			}
+			sb.append('}');
+		} else {
+			sb.append(o);
+		}
+	}
+
+	// ------------------------------------------------------------------ minimal NBT reader
+
+	private static Object readNamedTag(DataInputStream in) throws IOException {
+		byte type = in.readByte();
+		if (type == 0) return null;
+		in.readUTF();
+		return readPayload(type, in);
+	}
+
+	private static Object readPayload(byte type, DataInputStream in) throws IOException {
+		return switch (type) {
+			case 1 -> in.readByte();
+			case 2 -> in.readShort();
+			case 3 -> in.readInt();
+			case 4 -> in.readLong();
+			case 5 -> in.readFloat();
+			case 6 -> in.readDouble();
+			case 7 -> {
+				int len = in.readInt();
+				byte[] b = new byte[len];
+				in.readFully(b);
+				yield b;
+			}
+			case 8 -> in.readUTF();
+			case 9 -> {
+				byte elemType = in.readByte();
+				int count = in.readInt();
+				List<Object> list = new ArrayList<>(Math.max(0, count));
+				for (int i = 0; i < count; i++) list.add(readPayload(elemType, in));
+				yield list;
+			}
+			case 10 -> {
+				Map<String, Object> map = new TreeMap<>();
+				byte childType;
+				while ((childType = in.readByte()) != 0) {
+					String key = in.readUTF();
+					map.put(key, readPayload(childType, in));
+				}
+				yield map;
+			}
+			case 11 -> {
+				int len = in.readInt();
+				int[] ints = new int[len];
+				for (int i = 0; i < len; i++) ints[i] = in.readInt();
+				yield ints;
+			}
+			case 12 -> {
+				int len = in.readInt();
+				long[] longs = new long[len];
+				for (int i = 0; i < len; i++) longs[i] = in.readLong();
+				yield longs;
+			}
+			default -> throw new IOException("Unknown NBT tag type: " + type);
+		};
+	}
+
+	@SuppressWarnings("unchecked")
+	private static Map<String, Object> asMap(Object o) {
+		return o instanceof Map<?, ?> m ? (Map<String, Object>) m : null;
+	}
+
+	@SuppressWarnings("unchecked")
+	private static List<Object> asList(Object o) {
+		return o instanceof List<?> l ? (List<Object>) l : null;
+	}
+
+	private static int num(Object o) {
+		return o instanceof Number n ? n.intValue() : 0;
+	}
+
+	private static double dbl(Object o) {
+		return o instanceof Number n ? n.doubleValue() : 0.0;
 	}
 }
