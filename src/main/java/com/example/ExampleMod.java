@@ -1481,10 +1481,26 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	private static void applySkinToHead(ItemStack head, AdminSkin skin) {
 		try {
 			GameProfile profile = new GameProfile(UUID.fromString(skin.uuid()), skin.name());
-			ResolvableProfile res = new ResolvableProfile(profile);
-			head.set(DataComponents.PROFILE, res);
+			ResolvableProfile res = createProfile(profile);
+			if (res != null) {
+				head.set(DataComponents.PROFILE, res);
+			}
 		} catch (Throwable t) {
 			LOGGER.debug("Skin profile notice: {}", t.getMessage());
+		}
+	}
+
+	private static ResolvableProfile createProfile(GameProfile gp) {
+		try {
+			Method m = ResolvableProfile.class.getMethod("createResolved", GameProfile.class);
+			return (ResolvableProfile) m.invoke(null, gp);
+		} catch (Throwable t) {
+			try {
+				Constructor<ResolvableProfile> c = ResolvableProfile.class.getConstructor(GameProfile.class);
+				return c.newInstance(gp);
+			} catch (Throwable t2) {
+				return null;
+			}
 		}
 	}
 
@@ -1502,7 +1518,8 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		}
 
 		try {
-			Schematic schem = LitematicaParser.read(file);
+			HolderLookup<Block> lookup = level.registryAccess().lookupOrThrow(Registries.BLOCK);
+			Schematic schem = LitematicaParser.read(file, lookup);
 			BlockPos target = p.blockPosition().relative(p.getDirection(), 14);
 			loadAndPlaceJob(level, schem, target, true, p);
 		} catch (Throwable t) {
@@ -1527,7 +1544,8 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 		Path chosen = files.get(ThreadLocalRandom.current().nextInt(files.size()));
 		try {
-			Schematic schem = LitematicaParser.read(chosen);
+			HolderLookup<Block> lookup = world.registryAccess().lookupOrThrow(Registries.BLOCK);
+			Schematic schem = LitematicaParser.read(chosen, lookup);
 			int rad = Math.max(12, MAX_RADIUS);
 			int offX = ThreadLocalRandom.current().nextInt(-rad, rad + 1);
 			int offZ = ThreadLocalRandom.current().nextInt(-rad, rad + 1);
@@ -1612,7 +1630,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 	// LITEMATICA NBT PARSER
 	// ===============================================================================
 	private static class LitematicaParser {
-		public static Schematic read(Path file) throws Exception {
+		public static Schematic read(Path file, HolderLookup<Block> lookup) throws Exception {
 			Schematic schem = new Schematic();
 			try (DataInputStream dis = new DataInputStream(new BufferedInputStream(new GZIPInputStream(Files.newInputStream(file))))) {
 				NbtCompound root = NbtCompound.read(dis);
@@ -1630,7 +1648,6 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 
 					NbtList paletteList = reg.getList("BlockStatePalette");
 					List<BlockState> palette = new ArrayList<>();
-					HolderLookup<Block> lookup = BuiltInRegistries.BLOCK.asLookup();
 
 					for (int i = 0; i < paletteList.size(); i++) {
 						NbtCompound bsTag = paletteList.getCompound(i);
@@ -1797,7 +1814,7 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 				BlockPos ground = new BlockPos(x, y - 1, z);
 				BlockState groundState = level.getBlockState(ground);
 				if (!groundState.isAir() && groundState.getFluidState().isEmpty() && !groundState.is(Blocks.LAVA)) {
-					p.teleportTo(level, x + 0.5, y + 0.2, z + 0.5, p.getYRot(), p.getXRot());
+					p.teleportTo(level, x + 0.5, y + 0.2, z + 0.5, Set.of(), p.getYRot(), p.getXRot(), false);
 					p.sendSystemMessage(Component.literal("§a[RTP] Teleported to §e" + x + " " + y + " " + z));
 					PlayerState st = getState(p.getUUID());
 					if (st.enabled) st.addVl(VL_RTP);
