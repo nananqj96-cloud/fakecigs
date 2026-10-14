@@ -54,7 +54,6 @@ import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.MultiBufferSource;
-import net.minecraft.client.renderer.RenderType;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.blocks.BlockStateParser;
@@ -704,16 +703,27 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		}
 		if (consumers == null) return;
 
-		RenderType renderType = getOverlayRenderType();
+		Object renderType = getOverlayRenderType(consumers);
 		if (renderType == null) return;
 
 		VertexConsumer consumer = null;
 		try {
-			consumer = consumers.getBuffer(renderType);
-		} catch (Throwable t) {
+			for (Method m : consumers.getClass().getMethods()) {
+				if (m.getName().equals("getBuffer") && m.getParameterCount() == 1) {
+					if (m.getParameterTypes()[0].isInstance(renderType)) {
+						m.setAccessible(true);
+						consumer = (VertexConsumer) m.invoke(consumers, renderType);
+						break;
+					}
+				}
+			}
+		} catch (Throwable ignored) {}
+
+		if (consumer == null) {
 			for (Method m : consumers.getClass().getMethods()) {
 				if (m.getName().equals("getBuffer") && m.getParameterCount() == 1) {
 					try {
+						m.setAccessible(true);
 						consumer = (VertexConsumer) m.invoke(consumers, renderType);
 						if (consumer != null) break;
 					} catch (Throwable ignored) {}
@@ -839,15 +849,25 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 			poseStack.popPose();
 		}
 
-		// Flush batch to GPU
+		// Flush batch to GPU so it renders immediately
 		try {
-			if (consumers instanceof MultiBufferSource.BufferSource bs) {
-				bs.endBatch(renderType);
+			for (Method m : consumers.getClass().getMethods()) {
+				if (m.getName().equals("endBatch") && m.getParameterCount() == 1) {
+					if (m.getParameterTypes()[0].isInstance(renderType)) {
+						m.setAccessible(true);
+						m.invoke(consumers, renderType);
+						break;
+					}
+				}
 			}
 		} catch (Throwable t) {
 			try {
-				if (consumers instanceof MultiBufferSource.BufferSource bs) {
-					bs.endBatch();
+				for (Method m : consumers.getClass().getMethods()) {
+					if (m.getName().equals("endBatch") && m.getParameterCount() == 0) {
+						m.setAccessible(true);
+						m.invoke(consumers);
+						break;
+					}
 				}
 			} catch (Throwable ignored) {}
 		}
@@ -892,33 +912,74 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		} catch (Throwable ignored) {}
 	}
 
-	private static RenderType getOverlayRenderType() {
-		try {
-			return RenderType.debugQuads();
-		} catch (Throwable t) {
+	private static Object getOverlayRenderType(MultiBufferSource consumers) {
+		Class<?> targetType = null;
+		if (consumers != null) {
+			for (Method m : consumers.getClass().getMethods()) {
+				if (m.getName().equals("getBuffer") && m.getParameterCount() == 1) {
+					Class<?> p = m.getParameterTypes()[0];
+					if (p != Object.class) {
+						targetType = p;
+						break;
+					}
+				}
+			}
+		}
+
+		List<String> candidateClasses = new ArrayList<>();
+		if (targetType != null) {
+			candidateClasses.add(targetType.getName());
+			String pkg = targetType.getPackageName();
+			candidateClasses.add(pkg + ".RenderTypes");
+			candidateClasses.add(pkg + ".RenderType");
+		}
+		candidateClasses.addAll(Arrays.asList(
+				"net.minecraft.client.renderer.rendertype.RenderTypes",
+				"net.minecraft.client.renderer.rendertype.RenderType",
+				"net.minecraft.client.renderer.RenderTypes",
+				"net.minecraft.client.renderer.RenderType"
+		));
+
+		String[] methodNames = {"debugQuads", "lightning", "lines", "translucent", "tripwire", "cutout"};
+
+		for (String clsName : candidateClasses) {
 			try {
-				return RenderType.lightning();
-			} catch (Throwable t2) {
-				String[] typesClasses = {
-						"net.minecraft.client.renderer.RenderType",
-						"net.minecraft.client.renderer.rendertype.RenderTypes"
-				};
-				for (String cName : typesClasses) {
+				Class<?> cls = Class.forName(clsName);
+				for (String mName : methodNames) {
 					try {
-						Class<?> c = Class.forName(cName);
-						for (String mName : new String[]{"debugQuads", "lightning", "lines"}) {
-							try {
-								Method m = c.getMethod(mName);
-								m.setAccessible(true);
-								Object res = m.invoke(null);
-								if (res instanceof RenderType rt) return rt;
-							} catch (Throwable ignored) {}
+						Method m = cls.getMethod(mName);
+						m.setAccessible(true);
+						Object res = m.invoke(null);
+						if (res != null) {
+							if (targetType == null || targetType.isInstance(res)) {
+								return res;
+							}
 						}
 					} catch (Throwable ignored) {}
 				}
-				return null;
+			} catch (Throwable ignored) {}
+		}
+
+		if (targetType != null) {
+			for (String clsName : candidateClasses) {
+				try {
+					Class<?> cls = Class.forName(clsName);
+					for (Method m : cls.getMethods()) {
+						if (m.getParameterCount() == 0 && java.lang.reflect.Modifier.isStatic(m.getModifiers())) {
+							if (targetType.isAssignableFrom(m.getReturnType())) {
+								try {
+									m.setAccessible(true);
+									Object res = m.invoke(null);
+									if (res != null) return res;
+								} catch (Throwable ignored) {}
+							}
+						}
+					}
+				} catch (Throwable ignored) {}
 			}
 		}
+
+		return null;
 	}
 
 	private static double getGroundYForSpot(ClientLevel level, Player player, SusSpot spot) {
