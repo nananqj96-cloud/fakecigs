@@ -836,14 +836,14 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		} catch (Throwable ignored) {}
 
 		int refY = (int) player.getY();
-		int startY = Math.min(level.getMaxBuildHeight() - 1, Math.max(level.getMinBuildHeight() + 10, refY + 30));
-		int minY = Math.max(level.getMinBuildHeight(), refY - 40);
+		int startY = Math.min(level.getMaxY() - 1, Math.max(level.getMinY() + 10, refY + 30));
+		int minY = Math.max(level.getMinY(), refY - 40);
 
 		BlockPos.MutableBlockPos mpos = new BlockPos.MutableBlockPos(bx, startY, bz);
 		for (int y = startY; y >= minY; y--) {
 			mpos.setY(y);
 			BlockState state = level.getBlockState(mpos);
-			if (!state.isAir() && state.blocksMotion()) {
+			if (!state.isAir()) {
 				spot.cachedGroundY = y + 1.02;
 				return spot.cachedGroundY;
 			}
