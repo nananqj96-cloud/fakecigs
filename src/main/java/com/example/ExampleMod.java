@@ -85,7 +85,6 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
-import org.joml.Vector3f;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -491,7 +490,8 @@ public class ExampleMod implements ModInitializer, ClientModInitializer {
 		int boxH = SUS_HEIGHTS[susHeightIndex];
 		float particleScale = 0.5f + (opacity * 0.9f);
 
-		DustParticleOptions particle = new DustParticleOptions(new Vector3f(r, g, b), particleScale);
+		int colorRgb = (((int) (r * 255.0f) & 0xFF) << 16) | (((int) (g * 255.0f) & 0xFF) << 8) | ((int) (b * 255.0f) & 0xFF);
+		DustParticleOptions particle = new DustParticleOptions(colorRgb, particleScale);
 
 		// Determine perimeter point density step based on opacity
 		int pointStep = (opacity <= 0.25f) ? 3 : (opacity <= 0.50f ? 2 : 1);
